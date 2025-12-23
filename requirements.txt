@@ -5,9 +5,15 @@ uvicorn[standard]>=0.32.0
 # YouTube audio extraction
 yt-dlp>=2024.12.13
 
+# YouTube captions (primary method - no cookies needed)
+youtube-transcript-api>=1.0.0
+
 # AssemblyAI transcription
 assemblyai>=0.36.0
 
 # Configuration
 python-dotenv>=1.0.0
 pydantic-settings>=2.6.0
+
+# Proxy support
+PySocks>=1.7.1

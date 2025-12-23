@@ -1,9 +1,16 @@
+import logging
 import os
 import re
 import tempfile
+import urllib.request
+import urllib.error
+import json
 from typing import Any
 
 import yt_dlp
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class YouTubeError(Exception):
@@ -44,17 +51,33 @@ _cookies_exist = os.path.exists(COOKIES_FILE)
 print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}")
 
 # Common yt-dlp options to avoid bot detection
-COMMON_YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "cookiefile": COOKIES_FILE if _cookies_exist else None,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-us,en;q=0.5",
-        "Sec-Fetch-Mode": "navigate",
-    },
-}
+def get_common_ydl_opts():
+    """Get common yt-dlp options, including proxy if enabled."""
+    settings = get_settings()
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "cookiefile": COOKIES_FILE if _cookies_exist else None,
+        "sleep_interval": 1,
+        "max_sleep_interval": 5,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
+        },
+    }
+    
+    if settings.tor_proxy_enabled:
+        opts["proxy"] = settings.tor_proxy_url
+        logger.info(f"Using Tor proxy for yt-dlp: {settings.tor_proxy_url}")
+        
+    return opts
 
 # YouTube URL patterns
 YOUTUBE_URL_PATTERNS = [
@@ -92,9 +115,65 @@ def is_valid_youtube_url(url: str) -> bool:
     return extract_video_id(url) is not None
 
 
+def _get_metadata_via_oembed(video_id: str) -> dict[str, Any]:
+    """
+    Get video metadata via YouTube's oEmbed API (no auth required).
+
+    This is a fallback when yt-dlp fails due to cookie/bot issues.
+    Returns basic metadata: title, author, thumbnail.
+    Does NOT return duration (oEmbed doesn't provide it).
+
+    Args:
+        video_id: YouTube video ID
+
+    Returns:
+        dict with video_id, title, channel_name, thumbnail
+
+    Raises:
+        VideoNotFoundError: If video doesn't exist
+        VideoUnavailableError: If video is private/unavailable
+    """
+    oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+
+    try:
+        req = urllib.request.Request(
+            oembed_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+            return {
+                "video_id": video_id,
+                "title": data.get("title", "Unknown"),
+                "channel_name": data.get("author_name", "Unknown"),
+                "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                "thumbnail_small": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+                "duration": 0,  # oEmbed doesn't provide duration
+                "view_count": None,
+                "upload_date": None,
+                "description": "",
+            }
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise VideoNotFoundError(f"Video not found: {video_id}")
+        elif e.code == 401 or e.code == 403:
+            raise VideoUnavailableError(f"Video is private or unavailable: {video_id}")
+        else:
+            raise YouTubeError(f"HTTP error {e.code}: {e.reason}")
+    except Exception as e:
+        raise YouTubeError(f"Failed to get oEmbed metadata: {e}")
+
+
 def get_video_metadata(video_url: str) -> dict[str, Any]:
     """
     Extract video metadata without downloading.
+
+    Uses yt-dlp first (more complete data), falls back to oEmbed API
+    if yt-dlp fails due to cookie/bot detection issues.
 
     Returns:
         dict with video_id, title, channel_name, thumbnail, duration, etc.
@@ -107,11 +186,12 @@ def get_video_metadata(video_url: str) -> dict[str, Any]:
     normalized_url = f"https://www.youtube.com/watch?v={video_id}"
 
     ydl_opts = {
-        **COMMON_YDL_OPTS,
+        **get_common_ydl_opts(),
         "extract_flat": False,
         "skip_download": True,
     }
 
+    # Try yt-dlp first (gives us duration and more metadata)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(normalized_url, download=False)
@@ -119,6 +199,7 @@ def get_video_metadata(video_url: str) -> dict[str, Any]:
             if info is None:
                 raise VideoNotFoundError(f"Video not found: {video_id}")
 
+            logger.info(f"Got metadata via yt-dlp for {video_id}")
             return {
                 "video_id": video_id,
                 "title": info.get("title", "Unknown"),
@@ -133,14 +214,40 @@ def get_video_metadata(video_url: str) -> dict[str, Any]:
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e).lower()
-        if "private" in error_msg or "unavailable" in error_msg:
-            raise VideoUnavailableError(f"Video is private or unavailable: {video_id}")
-        elif "age" in error_msg:
-            raise VideoUnavailableError(f"Video requires age verification: {video_id}")
-        else:
+        # Check for definitive errors that won't be fixed by oEmbed
+        if "private" in error_msg:
+            raise VideoUnavailableError(f"Video is private: {video_id}")
+
+        # For bot detection / cookie issues, try oEmbed fallback
+        if "sign in" in error_msg or "bot" in error_msg or "cookies" in error_msg:
+            logger.warning(f"yt-dlp blocked by bot detection, trying oEmbed for {video_id}")
+            try:
+                return _get_metadata_via_oembed(video_id)
+            except (VideoNotFoundError, VideoUnavailableError):
+                raise
+            except Exception as oembed_error:
+                logger.warning(f"oEmbed also failed: {oembed_error}")
+                # Re-raise original yt-dlp error
+                raise VideoNotFoundError(f"Failed to get video info: {e}")
+
+        # For other errors, try oEmbed as fallback
+        logger.warning(f"yt-dlp failed ({e}), trying oEmbed for {video_id}")
+        try:
+            return _get_metadata_via_oembed(video_id)
+        except (VideoNotFoundError, VideoUnavailableError):
+            raise
+        except Exception:
             raise VideoNotFoundError(f"Failed to get video info: {e}")
+
     except Exception as e:
-        raise YouTubeError(f"Unexpected error: {e}")
+        # For any other error, try oEmbed
+        logger.warning(f"yt-dlp error ({e}), trying oEmbed for {video_id}")
+        try:
+            return _get_metadata_via_oembed(video_id)
+        except (VideoNotFoundError, VideoUnavailableError):
+            raise
+        except Exception:
+            raise YouTubeError(f"Unexpected error: {e}")
 
 
 def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -172,7 +279,7 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
 
     # yt-dlp options with anti-bot detection measures
     ydl_opts = {
-        **COMMON_YDL_OPTS,
+        **get_common_ydl_opts(),
         "format": "bestaudio*/best",  # Very flexible - any audio or best overall
         "outtmpl": output_template,
         "postprocessors": [

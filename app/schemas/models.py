@@ -66,7 +66,7 @@ class Utterance(BaseModel):
 
 
 class TranscriptData(BaseModel):
-    """Transcript data from AssemblyAI."""
+    """Transcript data from AssemblyAI or YouTube captions."""
 
     id: str
     text: str | None
@@ -75,6 +75,7 @@ class TranscriptData(BaseModel):
     confidence: float | None
     audio_duration: int | None  # seconds
     language: str | None
+    method: str | None = None  # "youtube_captions", "ytdlp_assemblyai", or "assemblyai_direct"
 
 
 class VideoMetadata(BaseModel):

@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import tempfile
@@ -12,28 +13,32 @@ from app.schemas.models import (
     TranscriptData,
     Utterance,
 )
-from app.services.transcription import TranscriptionError, transcribe_audio
+from app.services.transcript_service import (
+    get_transcript,
+    NoCaptionsAvailableError,
+)
 from app.services.youtube import (
-    DownloadError,
     VideoNotFoundError,
     VideoUnavailableError,
     YouTubeError,
-    download_audio,
     get_video_metadata,
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
     """
-    Download a YouTube video's audio and transcribe it with AssemblyAI.
+    Get transcript for a YouTube video using 3-tier fallback strategy.
 
-    This endpoint:
-    1. Downloads the audio from the YouTube video using yt-dlp
-    2. Uploads it to AssemblyAI for transcription
-    3. Returns the transcript with speaker diarization (if enabled)
+    Strategy:
+    1. Try YouTube's built-in captions (fast, no auth needed)
+    2. Fall back to yt-dlp + AssemblyAI if captions unavailable
+    3. Try AssemblyAI direct URL as last resort
+
+    Note: Speaker diarization is only available via AssemblyAI (Tier 2/3).
 
     The audio file is automatically cleaned up after transcription.
     """
@@ -47,38 +52,43 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
         except (VideoNotFoundError, VideoUnavailableError) as e:
             return TranscribeResponse(success=False, error=str(e))
 
-        # Check if video is too long
+        # Check if video is too long (only if we have duration info)
+        # oEmbed fallback doesn't provide duration, so we skip the check in that case
         duration = metadata.get("duration", 0)
-        if duration > settings.max_video_duration_seconds:
+        if duration > 0 and duration > settings.max_video_duration_seconds:
             max_minutes = settings.max_video_duration_seconds // 60
             return TranscribeResponse(
                 success=False,
                 error=f"Video is too long ({duration // 60} minutes). Maximum allowed is {max_minutes} minutes.",
             )
 
-        # Create temp directory for audio file
+        # Create temp directory for potential audio download
         temp_dir = tempfile.mkdtemp()
 
-        # Download audio
+        # Get transcript using 3-tier fallback strategy
         try:
-            audio_path, download_metadata = download_audio(request.video_url, temp_dir)
-        except (VideoNotFoundError, VideoUnavailableError, DownloadError) as e:
-            return TranscribeResponse(success=False, error=str(e))
-
-        # Transcribe with AssemblyAI
-        try:
-            transcript_data = transcribe_audio(
-                audio_path=audio_path,
+            result = get_transcript(
+                video_url=request.video_url,
+                temp_dir=temp_dir,
                 speaker_labels=request.speaker_labels,
                 speakers_expected=request.speakers_expected,
                 language=request.language,
+                prefer_diarization=False,  # Always try captions first (faster)
             )
-        except TranscriptionError as e:
+        except (VideoNotFoundError, VideoUnavailableError) as e:
+            return TranscribeResponse(success=False, error=str(e))
+        except NoCaptionsAvailableError as e:
             return TranscribeResponse(success=False, error=str(e))
 
-        # Format utterances
+        # Log which method succeeded
+        logger.info(
+            f"Transcript obtained via {result.method.value} "
+            f"for video {metadata['video_id']}"
+        )
+
+        # Format utterances if available (only from AssemblyAI)
         utterances = None
-        if transcript_data.get("utterances"):
+        if result.utterances:
             utterances = [
                 Utterance(
                     speaker=u["speaker"],
@@ -87,7 +97,7 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
                     end=u["end"],
                     confidence=u["confidence"],
                 )
-                for u in transcript_data["utterances"]
+                for u in result.utterances
             ]
 
         # Build response
@@ -97,13 +107,14 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
             author=metadata["channel_name"],
             thumbnail=metadata["thumbnail"],
             transcript=TranscriptData(
-                id=transcript_data["id"],
-                text=transcript_data["text"],
+                id=result.transcript_id,
+                text=result.text,
                 utterances=utterances,
-                speakers=transcript_data["speakers"],
-                confidence=transcript_data["confidence"],
-                audio_duration=transcript_data["audio_duration"],
-                language=transcript_data["language"],
+                speakers=result.speakers,
+                confidence=result.confidence,
+                audio_duration=result.audio_duration or metadata.get("duration"),
+                language=result.language,
+                method=result.method.value,
             ),
         )
 
@@ -113,7 +124,7 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
         return TranscribeResponse(success=False, error=f"YouTube error: {e}")
 
     except Exception as e:
-        # Log unexpected errors in production
+        logger.exception(f"Unexpected error transcribing video: {e}")
         return TranscribeResponse(success=False, error=f"Unexpected error: {e}")
 
     finally:
