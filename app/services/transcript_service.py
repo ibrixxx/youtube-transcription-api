@@ -32,8 +32,12 @@ from app.services.youtube import (
     VideoUnavailableError,
     DownloadError,
     YouTubeError,
+    YouTubeBlockedError,
+    YouTubeRateLimitError,
+    YouTubeCookiesRequiredError,
     COOKIES_FILE,
 )
+from app.services.retry import retry_with_backoff, is_retryable_error
 from app.services.transcription import transcribe_audio, TranscriptionError, init_assemblyai
 
 logger = logging.getLogger(__name__)
@@ -468,16 +472,36 @@ def get_transcript(
         tier3_error = e
         logger.warning(f"[Tier 3] Unexpected error: {type(e).__name__}: {e}")
 
-    # All tiers failed - construct helpful error message
+    # All tiers failed - construct helpful error message with recommendations
     error_parts = []
+    recommendations = []
+
     if tier1_error:
         error_parts.append(f"Captions: {tier1_error}")
+        error_str = str(tier1_error).lower()
+        if "blocking" in error_str or "ip" in error_str:
+            recommendations.append("YouTube is blocking requests from this IP")
+
     if tier2_error:
         error_parts.append(f"Download: {tier2_error}")
+        error_str = str(tier2_error).lower()
+        if "sign in" in error_str or "bot" in error_str:
+            recommendations.append("Ensure POT token provider is running (bgutil-pot server)")
+        if "cookies" in error_str or "age" in error_str:
+            recommendations.append("Update cookies.txt with fresh browser cookies")
+        if "429" in error_str or "rate" in error_str:
+            recommendations.append("Rate limited - try again later")
+
     if tier3_error:
         error_parts.append(f"Direct: {tier3_error}")
 
     error_summary = "; ".join(error_parts)
+
+    # Add recommendations to error message if any
+    if recommendations:
+        unique_recommendations = list(dict.fromkeys(recommendations))  # Remove duplicates
+        error_summary += f" [Recommendations: {'; '.join(unique_recommendations)}]"
+
     logger.error(f"All transcript methods failed for {video_id}: {error_summary}")
 
     raise NoCaptionsAvailableError(

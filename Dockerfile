@@ -3,10 +3,12 @@
 
 FROM python:3.12-slim
 
-# Install ffmpeg (required by yt-dlp) and Tor (for IP rotation)
+# Install ffmpeg (required by yt-dlp), Tor (for IP rotation), and Node.js (for POT provider)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tor \
+    nodejs \
+    npm \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

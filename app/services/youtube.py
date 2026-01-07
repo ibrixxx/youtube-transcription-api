@@ -37,6 +37,24 @@ class DownloadError(YouTubeError):
     pass
 
 
+class YouTubeBlockedError(YouTubeError):
+    """Blocked by YouTube bot detection (e.g., 'Sign in to confirm you're not a bot')."""
+
+    pass
+
+
+class YouTubeRateLimitError(YouTubeError):
+    """Rate limited by YouTube (HTTP 429)."""
+
+    pass
+
+
+class YouTubeCookiesRequiredError(YouTubeError):
+    """Valid cookies required for this video (age-restricted, etc.)."""
+
+    pass
+
+
 # Get the cookies file path
 # In Docker container, it's at /app/cookies.txt
 # Locally, it's relative to project root
@@ -52,32 +70,77 @@ print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}")
 
 # Common yt-dlp options to avoid bot detection
 def get_common_ydl_opts():
-    """Get common yt-dlp options, including proxy if enabled."""
+    """
+    Get common yt-dlp options with POT provider support and optimized player clients.
+
+    Player client priority (2025):
+    1. mweb - works best with POT tokens
+    2. web_safari - provides HLS fallback, bypasses some restrictions
+    3. android - fallback for when web clients fail
+    4. web - last resort
+    """
     settings = get_settings()
     opts = {
         "quiet": True,
         "no_warnings": True,
         "cookiefile": COOKIES_FILE if _cookies_exist else None,
-        "sleep_interval": 1,
-        "max_sleep_interval": 5,
+        # Increased sleep intervals to avoid rate limiting
+        "sleep_interval": 2,
+        "max_sleep_interval": 8,
+        # Enhanced player client selection - try multiple clients in order of effectiveness
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                # mweb works best with POT tokens, web_safari provides HLS formats
+                "player_client": ["mweb", "web_safari", "android", "web"],
             }
         },
+        # Mobile-like headers to appear more legitimate
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
         },
+        # Retry configuration for transient failures
+        "retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
     }
-    
+
     if settings.tor_proxy_enabled:
         opts["proxy"] = settings.tor_proxy_url
         logger.info(f"Using Tor proxy for yt-dlp: {settings.tor_proxy_url}")
-        
+
+    # POT provider will be auto-detected by yt-dlp on port 4416
+    # No explicit configuration needed - bgutil-ytdlp-pot-provider registers as yt-dlp plugin
+
     return opts
+
+
+def classify_youtube_error(error_msg: str) -> type[YouTubeError]:
+    """
+    Classify YouTube error for better handling and user feedback.
+
+    Args:
+        error_msg: The error message from yt-dlp
+
+    Returns:
+        Appropriate exception class for the error type
+    """
+    error_lower = error_msg.lower()
+
+    if "sign in to confirm" in error_lower or "bot" in error_lower:
+        return YouTubeBlockedError
+    elif "429" in error_lower or "rate limit" in error_lower or "too many" in error_lower:
+        return YouTubeRateLimitError
+    elif "private" in error_lower:
+        return VideoUnavailableError
+    elif "age" in error_lower or "login" in error_lower or "cookies" in error_lower:
+        return YouTubeCookiesRequiredError
+    elif "not found" in error_lower or "404" in error_lower or "unavailable" in error_lower:
+        return VideoNotFoundError
+    else:
+        return DownloadError
 
 # YouTube URL patterns
 YOUTUBE_URL_PATTERNS = [
@@ -324,11 +387,28 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
             return audio_path, metadata
 
     except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e).lower()
-        if "private" in error_msg or "unavailable" in error_msg:
+        error_msg = str(e)
+        error_class = classify_youtube_error(error_msg)
+
+        if error_class == YouTubeBlockedError:
+            raise YouTubeBlockedError(
+                f"YouTube bot detection triggered for video {video_id}. "
+                "POT tokens may help - ensure bgutil-ytdlp-pot-provider is running."
+            )
+        elif error_class == YouTubeRateLimitError:
+            raise YouTubeRateLimitError(
+                f"Rate limited by YouTube for video {video_id}. "
+                "Try again later or use a different IP."
+            )
+        elif error_class == YouTubeCookiesRequiredError:
+            raise YouTubeCookiesRequiredError(
+                f"Cookies required for video {video_id}. "
+                "Update cookies.txt with fresh browser cookies."
+            )
+        elif error_class == VideoUnavailableError:
             raise VideoUnavailableError(f"Video is private or unavailable: {video_id}")
-        elif "age" in error_msg:
-            raise VideoUnavailableError(f"Video requires age verification: {video_id}")
+        elif error_class == VideoNotFoundError:
+            raise VideoNotFoundError(f"Video not found: {video_id}")
         else:
             raise DownloadError(f"Failed to download: {e}")
     except Exception as e:
