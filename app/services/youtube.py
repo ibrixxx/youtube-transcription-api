@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import socket
 import tempfile
 import urllib.request
 import urllib.error
@@ -74,12 +75,31 @@ def get_common_ydl_opts():
     Get common yt-dlp options with POT provider support and optimized player clients.
 
     Player client priority (2025):
-    1. mweb - works best with POT tokens
-    2. web_safari - provides HLS fallback, bypasses some restrictions
-    3. android - fallback for when web clients fail
-    4. web - last resort
+    1. tv_embedded - Rarely triggers bot detection, works for most videos
+    2. ios - Mobile iOS client, different fingerprint than web
+    3. mweb - works best with POT tokens (if POT is available)
+    4. android - mobile fallback
+    5. web_safari - provides HLS formats
+    6. web - last resort
     """
     settings = get_settings()
+
+    # Check if POT provider is actually running
+    pot_available = False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex(('127.0.0.1', 4416))
+        pot_available = (result == 0)
+        sock.close()
+    except Exception:
+        pass
+
+    if pot_available:
+        logger.info("POT provider detected on port 4416")
+    else:
+        logger.warning("POT provider NOT available - using fallback player clients only")
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -87,11 +107,12 @@ def get_common_ydl_opts():
         # Increased sleep intervals to avoid rate limiting
         "sleep_interval": 2,
         "max_sleep_interval": 8,
-        # Enhanced player client selection - try multiple clients in order of effectiveness
+        # Enhanced player client selection - try clients that rarely trigger bot detection first
         "extractor_args": {
             "youtube": {
-                # mweb works best with POT tokens, web_safari provides HLS formats
-                "player_client": ["mweb", "web_safari", "android", "web"],
+                # Reordered: tv_embedded and ios rarely trigger bot detection
+                # mweb works best WITH POT tokens but fails without them
+                "player_client": ["tv_embedded", "ios", "mweb", "android", "web_safari", "web"],
             }
         },
         # Mobile-like headers to appear more legitimate
@@ -111,8 +132,8 @@ def get_common_ydl_opts():
         opts["proxy"] = settings.tor_proxy_url
         logger.info(f"Using Tor proxy for yt-dlp: {settings.tor_proxy_url}")
 
-    # POT provider will be auto-detected by yt-dlp on port 4416
-    # No explicit configuration needed - bgutil-ytdlp-pot-provider registers as yt-dlp plugin
+    # POT provider will be auto-detected by yt-dlp on port 4416 if running
+    # bgutil-ytdlp-pot-provider registers as yt-dlp plugin
 
     return opts
 
