@@ -66,8 +66,26 @@ COOKIES_FILE = os.path.join(_project_root, "cookies.txt")
 if not os.path.exists(COOKIES_FILE) and os.path.exists("/app/cookies.txt"):
     COOKIES_FILE = "/app/cookies.txt"
 
+
+def _has_youtube_cookies(cookie_file: str) -> bool:
+    """Check if cookie file contains valid YouTube authentication cookies."""
+    if not os.path.exists(cookie_file):
+        return False
+    try:
+        with open(cookie_file, 'r') as f:
+            content = f.read()
+            # Check for YouTube domain AND essential auth cookies
+            # Cookies must be for .youtube.com domain with SAPISID (the key auth cookie)
+            has_youtube_domain = '.youtube.com' in content
+            has_sapisid = 'SAPISID' in content
+            return has_youtube_domain and has_sapisid
+    except Exception:
+        return False
+
+
 _cookies_exist = os.path.exists(COOKIES_FILE)
-print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}")
+_cookies_valid = _has_youtube_cookies(COOKIES_FILE) if _cookies_exist else False
+print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}, valid: {_cookies_valid}")
 
 # Common yt-dlp options to avoid bot detection
 def get_common_ydl_opts():
@@ -103,7 +121,10 @@ def get_common_ydl_opts():
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "cookiefile": COOKIES_FILE if _cookies_exist else None,
+        "cookiefile": COOKIES_FILE if _cookies_valid else None,
+        # Enable remote JS challenge solver (required for YouTube 2025+)
+        # Downloads solver from GitHub to handle YouTube's signature challenges
+        "remote_components": ["ejs:github"],
         # Increased sleep intervals to avoid rate limiting
         "sleep_interval": 2,
         "max_sleep_interval": 8,

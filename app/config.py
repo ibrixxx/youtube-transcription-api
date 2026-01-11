@@ -22,13 +22,23 @@ class Settings(BaseSettings):
     # Limits
     max_video_duration_seconds: int = 7200  # 2 hours max
 
-    # Tor proxy settings
-    tor_proxy_enabled: bool = True
+    # Tor proxy settings (disabled by default in development)
+    tor_proxy_enabled: bool = False
     tor_proxy_url: str = "socks5://127.0.0.1:9050"
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    @property
+    def is_development(self) -> bool:
+        """Check if running in development mode."""
+        return self.environment.lower() in ("development", "dev", "local")
+
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production mode."""
+        return self.environment.lower() == "production"
 
     @property
     def cors_origins_list(self) -> list[str]:
