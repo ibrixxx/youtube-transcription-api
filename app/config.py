@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     # Limits
     max_video_duration_seconds: int = 7200  # 2 hours max
 
-    # Tor proxy settings (disabled by default in development)
-    tor_proxy_enabled: bool = False
+    # Tor proxy settings (enabled by default - disable locally with TOR_PROXY_ENABLED=false)
+    tor_proxy_enabled: bool = True
     tor_proxy_url: str = "socks5://127.0.0.1:9050"
 
     class Config:
