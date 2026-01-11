@@ -32,25 +32,8 @@ else
     echo "Tor failed to start. Proceeding without Tor proxy..."
 fi
 
-# Start POT (Proof of Origin Token) provider server
-# This helps bypass YouTube's "Sign in to confirm you're not a bot" detection
-# by generating tokens using Google's BotGuard library
-echo "Starting POT Token provider on port 4416..."
-bgutil-pot server --port 4416 &
-POT_PID=$!
-
-# Wait for POT server to be ready with proper port verification
-# POT needs more time to initialize than just checking if process exists
-echo "Waiting for POT Token provider to be ready..."
-if wait_for_port 4416 "POT Token provider" 30; then
-    echo "POT Token provider is available (PID: $POT_PID)"
-else
-    echo "WARNING: POT Token provider failed to start. Videos without captions may fail."
-    # Check if process is at least running
-    if kill -0 $POT_PID 2>/dev/null; then
-        echo "POT process is running but port not ready - may still work"
-    fi
-fi
+# Note: POT provider removed - using deno + remote_components for JS challenges instead
+# This is simpler and more reliable than running a separate POT server
 
 # Start the API
 echo "Starting API..."

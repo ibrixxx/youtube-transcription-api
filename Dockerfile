@@ -3,14 +3,20 @@
 
 FROM python:3.12-slim
 
-# Install ffmpeg (required by yt-dlp), Tor (for IP rotation), and Node.js (for POT provider)
+# Install ffmpeg (required by yt-dlp), Tor (for IP rotation), Node.js, and dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tor \
     nodejs \
     npm \
+    curl \
+    unzip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno globally (required for yt-dlp JavaScript challenge solving in 2025+)
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    chmod +x /usr/local/bin/deno
 
 # Set working directory
 WORKDIR /app
@@ -24,8 +30,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app/ ./app/
 
-# Copy cookies file for YouTube authentication (optional fallback)
-COPY cookies.txt ./cookies.txt
+# Note: cookies.txt is NOT copied - yt-dlp works better without stale cookies
+# If you need cookies, add: COPY cookies.txt ./cookies.txt
 
 # Copy startup script
 COPY start.sh /app/start.sh
