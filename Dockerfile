@@ -3,7 +3,11 @@
 
 FROM python:3.12-slim
 
-# Install ffmpeg (required by yt-dlp), Tor (for IP rotation), Node.js, and dependencies
+# Install system dependencies:
+# - ffmpeg: required by yt-dlp for audio extraction
+# - tor: for IP rotation to bypass YouTube blocks
+# - nodejs/npm: for yt-dlp JavaScript challenge solving and pytubefix PO Token generation
+# - curl/unzip: for downloading components
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tor \
@@ -13,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Ensure Node.js is in PATH for pytubefix PO Token generation
+ENV PATH="/usr/bin:/usr/local/bin:${PATH}"
 
 # Install Deno globally (required for yt-dlp JavaScript challenge solving in 2025+)
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \

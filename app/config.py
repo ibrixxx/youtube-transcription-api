@@ -22,9 +22,16 @@ class Settings(BaseSettings):
     # Limits
     max_video_duration_seconds: int = 7200  # 2 hours max
 
-    # Tor proxy settings (enabled by default - disable locally with TOR_PROXY_ENABLED=false)
+    # Webshare residential proxy (primary - for YouTube downloads)
+    # Sign up at https://webshare.io for free tier (10 proxies, 1GB/month)
+    # Format: http://username:password@p.webshare.io:80
+    webshare_proxy_enabled: bool = False
+    webshare_proxy_url: str = ""
+
+    # Tor proxy settings (fallback when Webshare not configured)
+    # Using socks5h:// ensures DNS is also resolved through the proxy
     tor_proxy_enabled: bool = True
-    tor_proxy_url: str = "socks5://127.0.0.1:9050"
+    tor_proxy_url: str = "socks5h://127.0.0.1:9050"
 
     class Config:
         env_file = ".env"

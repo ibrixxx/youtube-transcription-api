@@ -90,15 +90,16 @@ print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}, valid:
 # Common yt-dlp options to avoid bot detection
 def get_common_ydl_opts():
     """
-    Get common yt-dlp options with POT provider support and optimized player clients.
+    Get common yt-dlp options with enhanced anti-bot detection measures.
 
     Player client priority (2025):
     1. tv_embedded - Rarely triggers bot detection, works for most videos
     2. ios - Mobile iOS client, different fingerprint than web
-    3. mweb - works best with POT tokens (if POT is available)
-    4. android - mobile fallback
-    5. web_safari - provides HLS formats
-    6. web - last resort
+    3. android_vr - VR client, often less restricted
+    4. mweb - works best with POT tokens (if POT is available)
+    5. android - mobile fallback
+    6. web_safari - provides HLS formats
+    7. web - last resort
     """
     settings = get_settings()
 
@@ -118,6 +119,9 @@ def get_common_ydl_opts():
     else:
         logger.warning("POT provider NOT available - using fallback player clients only")
 
+    # Note: curl_cffi was removed - the impersonate feature requires native deps
+    # that don't work reliably in Docker containers
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -126,14 +130,16 @@ def get_common_ydl_opts():
         # Downloads solver from GitHub to handle YouTube's signature challenges
         "remote_components": ["ejs:github"],
         # Increased sleep intervals to avoid rate limiting
-        "sleep_interval": 2,
-        "max_sleep_interval": 8,
+        "sleep_interval": 3,
+        "max_sleep_interval": 10,
+        "sleep_interval_requests": 2,  # Sleep between playlist/channel requests
+        # Geographic bypass to avoid region locks
+        "geo_bypass": True,
         # Enhanced player client selection - try clients that rarely trigger bot detection first
         "extractor_args": {
             "youtube": {
-                # Reordered: tv_embedded and ios rarely trigger bot detection
-                # mweb works best WITH POT tokens but fails without them
-                "player_client": ["tv_embedded", "ios", "mweb", "android", "web_safari", "web"],
+                # Extended client list with android_vr which is often less restricted
+                "player_client": ["tv_embedded", "ios", "android_vr", "mweb", "android", "web_safari", "web"],
             }
         },
         # Mobile-like headers to appear more legitimate
@@ -149,9 +155,15 @@ def get_common_ydl_opts():
         "file_access_retries": 3,
     }
 
-    if settings.tor_proxy_enabled:
+    # Proxy priority: Webshare (residential) > Tor > No proxy
+    if settings.webshare_proxy_enabled and settings.webshare_proxy_url:
+        opts["proxy"] = settings.webshare_proxy_url
+        print("[yt-dlp] Using Webshare residential proxy")
+        logger.info("[yt-dlp] Using Webshare residential proxy")
+    elif settings.tor_proxy_enabled:
         opts["proxy"] = settings.tor_proxy_url
-        logger.info(f"Using Tor proxy for yt-dlp: {settings.tor_proxy_url}")
+        print(f"[yt-dlp] Using Tor proxy (fallback): {settings.tor_proxy_url}")
+        logger.info(f"[yt-dlp] Using Tor proxy (fallback): {settings.tor_proxy_url}")
 
     # POT provider will be auto-detected by yt-dlp on port 4416 if running
     # bgutil-ytdlp-pot-provider registers as yt-dlp plugin
@@ -455,3 +467,137 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
             raise DownloadError(f"Failed to download: {e}")
     except Exception as e:
         raise YouTubeError(f"Unexpected error during download: {e}")
+
+
+def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> tuple[str, dict[str, Any]]:
+    """
+    Download YouTube audio using pytubefix (fallback when yt-dlp fails).
+
+    pytubefix is a maintained fork of pytube with different implementation
+    that may succeed when yt-dlp is blocked. Tries multiple client types
+    for maximum compatibility.
+
+    Note: pytubefix does NOT support SOCKS5 proxies natively. We run it
+    without proxy - it uses different client fingerprints (ANDROID, IOS, WEB)
+    which may bypass bot detection without needing a proxy.
+
+    Args:
+        video_url: YouTube video URL or ID
+        output_dir: Directory to save the audio file (uses temp dir if None)
+
+    Returns:
+        Tuple of (audio_file_path, metadata_dict)
+    """
+    from pytubefix import YouTube
+    from pytubefix.exceptions import (
+        VideoUnavailable as PTVideoUnavailable,
+        RegexMatchError,
+        AgeRestrictedError,
+    )
+
+    video_id = extract_video_id(video_url)
+    if not video_id:
+        raise VideoNotFoundError("Invalid YouTube URL format")
+
+    # Normalize URL
+    normalized_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Use provided dir or create temp directory
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp()
+
+    # Configure proxy for pytubefix
+    # Webshare provides HTTP proxies which pytubefix supports natively
+    settings = get_settings()
+    proxies = None
+    if settings.webshare_proxy_enabled and settings.webshare_proxy_url:
+        proxies = {"http": settings.webshare_proxy_url, "https": settings.webshare_proxy_url}
+        logger.info("[pytubefix] Using Webshare residential proxy")
+        print("[pytubefix] Using Webshare residential proxy")
+
+    # Try multiple client types - different clients have different success rates
+    # WEB: Uses BotGuard to auto-generate Proof of Origin token (requires Node.js)
+    # ANDROID: Mobile client, often less restricted
+    # IOS: iOS client, different fingerprint
+    # None: Default client (no special handling)
+    clients_to_try = ['WEB', 'ANDROID', 'IOS', None]
+
+    last_error = None
+
+    for client in clients_to_try:
+        client_name = client or "default"
+        logger.info(f"[pytubefix] Trying {client_name} client for video: {video_id}")
+        print(f"[pytubefix] Trying {client_name} client for video: {video_id}")
+
+        try:
+            # Create YouTube object with specific client and optional proxy
+            if client:
+                yt = YouTube(normalized_url, client, proxies=proxies)
+            else:
+                yt = YouTube(normalized_url, proxies=proxies)
+
+            # Get audio-only stream (best quality)
+            audio_stream = yt.streams.get_audio_only()
+            if not audio_stream:
+                # Try to get any audio stream
+                audio_stream = yt.streams.filter(only_audio=True).first()
+
+            if not audio_stream:
+                logger.warning(f"[pytubefix] No audio stream with {client_name} client")
+                continue
+
+            # Download the audio
+            output_filename = f"{video_id}.m4a"
+            audio_path = audio_stream.download(
+                output_path=output_dir,
+                filename=output_filename,
+            )
+
+            # Verify file exists
+            if not os.path.exists(audio_path):
+                logger.warning(f"[pytubefix] Download completed but file not found with {client_name}")
+                continue
+
+            metadata = {
+                "video_id": video_id,
+                "title": yt.title or "Unknown",
+                "channel_name": yt.author or "Unknown",
+                "thumbnail": yt.thumbnail_url or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                "duration": yt.length or 0,
+            }
+
+            logger.info(f"[pytubefix] Successfully downloaded with {client_name} client: {audio_path}")
+            return audio_path, metadata
+
+        except PTVideoUnavailable as e:
+            logger.warning(f"[pytubefix] Video unavailable with {client_name}: {e}")
+            last_error = e
+            continue
+        except AgeRestrictedError as e:
+            # Age restriction is the same across all clients
+            logger.warning(f"[pytubefix] Age restricted video: {e}")
+            raise YouTubeCookiesRequiredError(f"Age-restricted video requires authentication: {video_id}")
+        except RegexMatchError as e:
+            logger.warning(f"[pytubefix] Regex match error with {client_name}: {e}")
+            last_error = e
+            continue
+        except Exception as e:
+            error_msg = str(e).lower()
+            logger.warning(f"[pytubefix] Error with {client_name} client: {e}")
+            last_error = e
+
+            # Some errors are definitive - don't try other clients
+            if "private" in error_msg:
+                raise VideoUnavailableError(f"Video is private: {video_id}")
+
+            # Continue to try other clients
+            continue
+
+    # All clients failed
+    error_msg = str(last_error).lower() if last_error else ""
+    if "bot" in error_msg or "sign in" in error_msg:
+        raise YouTubeBlockedError(f"All pytubefix clients blocked by bot detection: {last_error}")
+    elif "unavailable" in error_msg or "not found" in error_msg:
+        raise VideoNotFoundError(f"Video not found via pytubefix (tried all clients): {video_id}")
+    else:
+        raise DownloadError(f"All pytubefix clients failed for {video_id}: {last_error}")

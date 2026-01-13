@@ -28,6 +28,7 @@ from app.config import get_settings
 from app.services.youtube import (
     extract_video_id,
     download_audio,
+    download_audio_pytubefix,
     VideoNotFoundError,
     VideoUnavailableError,
     DownloadError,
@@ -48,6 +49,7 @@ class TranscriptMethod(str, Enum):
 
     YOUTUBE_CAPTIONS = "youtube_captions"
     YTDLP_ASSEMBLYAI = "ytdlp_assemblyai"
+    PYTUBEFIX_ASSEMBLYAI = "pytubefix_assemblyai"
     ASSEMBLYAI_DIRECT = "assemblyai_direct"
 
 
@@ -87,7 +89,6 @@ def _get_preferred_languages(requested_language: str | None) -> list[str]:
     Returns:
         List of language codes in priority order
     """
-    # Default priority list
     default_languages = ["en", "en-US", "en-GB"]
 
     if requested_language:
@@ -282,6 +283,64 @@ def _fetch_with_ytdlp_assemblyai(
     )
 
 
+def _fetch_with_pytubefix_assemblyai(
+    video_id: str,
+    video_url: str,
+    temp_dir: str,
+    speaker_labels: bool = True,
+    speakers_expected: int | None = None,
+    language: str | None = None,
+) -> TranscriptResult:
+    """
+    Fetch transcript using pytubefix + AssemblyAI (Tier 3).
+
+    This is a fallback when yt-dlp fails. pytubefix uses a different
+    implementation that may succeed when yt-dlp is blocked.
+
+    Args:
+        video_id: YouTube video ID
+        video_url: Full YouTube URL
+        temp_dir: Temporary directory for audio file
+        speaker_labels: Enable speaker diarization
+        speakers_expected: Expected number of speakers
+        language: Preferred language code
+
+    Returns:
+        TranscriptResult with AssemblyAI transcript data
+
+    Raises:
+        Various youtube and transcription exceptions on failure
+    """
+    logger.info(f"[Tier 3] Attempting pytubefix + AssemblyAI for video: {video_id}")
+
+    # Download audio using pytubefix
+    audio_path, _ = download_audio_pytubefix(video_url, temp_dir)
+
+    # Transcribe with AssemblyAI
+    transcript_data = transcribe_audio(
+        audio_path=audio_path,
+        speaker_labels=speaker_labels,
+        speakers_expected=speakers_expected,
+        language=language,
+    )
+
+    logger.info(
+        f"[Tier 3] SUCCESS - Transcript ID: {transcript_data['id']}, "
+        f"duration: {transcript_data['audio_duration']}s"
+    )
+
+    return TranscriptResult(
+        method=TranscriptMethod.PYTUBEFIX_ASSEMBLYAI,
+        text=transcript_data["text"],
+        utterances=transcript_data["utterances"],
+        speakers=transcript_data["speakers"],
+        confidence=transcript_data["confidence"],
+        audio_duration=transcript_data["audio_duration"],
+        language=transcript_data["language"],
+        transcript_id=transcript_data["id"],
+    )
+
+
 def _fetch_with_assemblyai_direct(
     video_id: str,
     video_url: str,
@@ -379,12 +438,13 @@ def get_transcript(
     prefer_diarization: bool = False,
 ) -> TranscriptResult:
     """
-    Get transcript using 3-tier fallback strategy.
+    Get transcript using 4-tier fallback strategy.
 
     Strategy:
-    1. Try youtube-transcript-api (fast, no cookies needed)
+    1. Try youtube-transcript-api (fast, for videos with captions)
     2. If that fails, use yt-dlp + AssemblyAI
-    3. If that fails, try AssemblyAI direct URL
+    3. If that fails, use pytubefix + AssemblyAI (different implementation)
+    4. If that fails, try AssemblyAI direct URL (last resort)
 
     Args:
         video_url: YouTube video URL or ID
@@ -414,6 +474,7 @@ def get_transcript(
     tier1_error: Exception | None = None
     tier2_error: Exception | None = None
     tier3_error: Exception | None = None
+    tier4_error: Exception | None = None
 
     # --- Tier 1: youtube-transcript-api ---
     # Skip if user specifically wants speaker diarization
@@ -448,7 +509,7 @@ def get_transcript(
         # Don't re-raise yet, try Tier 3
     except DownloadError as e:
         tier2_error = e
-        logger.warning(f"[Tier 2] Download failed (likely cookie issue): {e}")
+        logger.warning(f"[Tier 2] yt-dlp download failed: {e}")
     except TranscriptionError as e:
         tier2_error = e
         logger.warning(f"[Tier 2] Transcription failed: {e}")
@@ -456,7 +517,31 @@ def get_transcript(
         tier2_error = e
         logger.warning(f"[Tier 2] Unexpected error: {type(e).__name__}: {e}")
 
-    # --- Tier 3: AssemblyAI direct URL ---
+    # --- Tier 3: pytubefix + AssemblyAI ---
+    # pytubefix uses a different implementation that may succeed when yt-dlp fails
+    try:
+        return _fetch_with_pytubefix_assemblyai(
+            video_id=video_id,
+            video_url=normalized_url,
+            temp_dir=temp_dir,
+            speaker_labels=speaker_labels,
+            speakers_expected=speakers_expected,
+            language=language,
+        )
+    except (VideoNotFoundError, VideoUnavailableError) as e:
+        tier3_error = e
+        logger.warning(f"[Tier 3] Video error: {e}")
+    except DownloadError as e:
+        tier3_error = e
+        logger.warning(f"[Tier 3] pytubefix download failed: {e}")
+    except TranscriptionError as e:
+        tier3_error = e
+        logger.warning(f"[Tier 3] Transcription failed: {e}")
+    except Exception as e:
+        tier3_error = e
+        logger.warning(f"[Tier 3] Unexpected error: {type(e).__name__}: {e}")
+
+    # --- Tier 4: AssemblyAI direct URL ---
     try:
         return _fetch_with_assemblyai_direct(
             video_id=video_id,
@@ -466,11 +551,11 @@ def get_transcript(
             language=language,
         )
     except TranscriptionError as e:
-        tier3_error = e
-        logger.warning(f"[Tier 3] AssemblyAI direct failed: {e}")
+        tier4_error = e
+        logger.warning(f"[Tier 4] AssemblyAI direct failed: {e}")
     except Exception as e:
-        tier3_error = e
-        logger.warning(f"[Tier 3] Unexpected error: {type(e).__name__}: {e}")
+        tier4_error = e
+        logger.warning(f"[Tier 4] Unexpected error: {type(e).__name__}: {e}")
 
     # All tiers failed - construct helpful error message with recommendations
     error_parts = []
@@ -483,17 +568,23 @@ def get_transcript(
             recommendations.append("YouTube is blocking requests from this IP")
 
     if tier2_error:
-        error_parts.append(f"Download: {tier2_error}")
+        error_parts.append(f"yt-dlp: {tier2_error}")
         error_str = str(tier2_error).lower()
-        if "sign in" in error_str or "bot" in error_str:
-            recommendations.append("Ensure POT token provider is running (bgutil-pot server)")
+        if "sign in" in error_str or "bot" in error_str or "player response" in error_str:
+            recommendations.append("YouTube is blocking yt-dlp requests")
         if "cookies" in error_str or "age" in error_str:
             recommendations.append("Update cookies.txt with fresh browser cookies")
         if "429" in error_str or "rate" in error_str:
             recommendations.append("Rate limited - try again later")
 
     if tier3_error:
-        error_parts.append(f"Direct: {tier3_error}")
+        error_parts.append(f"pytubefix: {tier3_error}")
+        error_str = str(tier3_error).lower()
+        if "bot" in error_str or "sign in" in error_str:
+            recommendations.append("YouTube is blocking pytubefix requests")
+
+    if tier4_error:
+        error_parts.append(f"Direct: {tier4_error}")
 
     error_summary = "; ".join(error_parts)
 
