@@ -22,13 +22,21 @@ class Settings(BaseSettings):
     # Limits
     max_video_duration_seconds: int = 7200  # 2 hours max
 
-    # Webshare residential proxy (primary - for YouTube downloads)
-    # Sign up at https://webshare.io for free tier (10 proxies, 1GB/month)
-    # Format: http://username:password@p.webshare.io:80
+    # yt-dlp sleep intervals (low values are fine for single-video requests)
+    ytdlp_sleep_interval: int = 0
+    ytdlp_max_sleep_interval: int = 2
+    ytdlp_sleep_interval_requests: int = 0
+
+    # Residential proxy (primary - for YouTube downloads)
+    # Format: http://username:password@proxy-host:port
+    residential_proxy_enabled: bool = False
+    residential_proxy_url: str = ""
+
+    # Legacy aliases for backward compatibility with .env files
     webshare_proxy_enabled: bool = False
     webshare_proxy_url: str = ""
 
-    # Tor proxy settings (fallback when Webshare not configured)
+    # Tor proxy settings (fallback when residential proxy not configured)
     # Using socks5h:// ensures DNS is also resolved through the proxy
     tor_proxy_enabled: bool = True
     tor_proxy_url: str = "socks5h://127.0.0.1:9050"
@@ -36,6 +44,16 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    @property
+    def proxy_enabled(self) -> bool:
+        """Check if residential proxy is enabled (supports both new and legacy env vars)."""
+        return self.residential_proxy_enabled or self.webshare_proxy_enabled
+
+    @property
+    def proxy_url(self) -> str:
+        """Get residential proxy URL (supports both new and legacy env vars)."""
+        return self.residential_proxy_url or self.webshare_proxy_url
 
     @property
     def is_development(self) -> bool:

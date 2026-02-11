@@ -126,6 +126,11 @@ def _get_proxy_config() -> GenericProxyConfig | None:
     Get proxy configuration for youtube-transcript-api.
     """
     settings = get_settings()
+    if settings.proxy_enabled and settings.proxy_url:
+        return GenericProxyConfig(
+            http_url=settings.proxy_url,
+            https_url=settings.proxy_url,
+        )
     if settings.tor_proxy_enabled:
         return GenericProxyConfig(
             http_url=settings.tor_proxy_url,
@@ -152,6 +157,32 @@ def _get_http_client() -> requests.Session | None:
         return None
 
 
+def _try_fetch_captions(
+    video_id: str,
+    languages: list[str],
+    use_proxy: bool = True,
+) -> "tuple[Any, str]":
+    """
+    Attempt to fetch captions with or without proxy.
+
+    Returns:
+        Tuple of (transcript object, description string for logging)
+    """
+    http_client = _get_http_client()
+    proxy_config = _get_proxy_config() if use_proxy else None
+
+    kwargs = {}
+    if http_client:
+        kwargs["http_client"] = http_client
+    if proxy_config:
+        kwargs["proxy_config"] = proxy_config
+
+    desc = "with proxy" if proxy_config else "without proxy"
+    ytt = YouTubeTranscriptApi(**kwargs)
+    transcript = ytt.fetch(video_id, languages=languages)
+    return transcript, desc
+
+
 def _fetch_youtube_captions(
     video_id: str,
     language: str | None = None,
@@ -159,8 +190,9 @@ def _fetch_youtube_captions(
     """
     Fetch transcript using youtube-transcript-api (Tier 1).
 
-    This method fetches YouTube's built-in captions (auto-generated or manual)
-    using cookies if available to avoid IP blocks.
+    This method fetches YouTube's built-in captions (auto-generated or manual).
+    If the proxied attempt fails, retries once without proxy — some Fly.io IPs
+    aren't blocked by YouTube for caption fetching.
 
     Args:
         video_id: YouTube video ID
@@ -175,24 +207,23 @@ def _fetch_youtube_captions(
     logger.info(f"[Tier 1] Attempting youtube-transcript-api for video: {video_id}")
 
     languages = _get_preferred_languages(language)
-    http_client = _get_http_client()
     proxy_config = _get_proxy_config()
 
-    # Fetch transcript with language preference (v1.0.0+ API)
-    # Note: We create a new instance each time as per library recommendations for thread safety
-    # when using custom http_client
-    kwargs = {}
-    if http_client:
-        logger.info("[Tier 1] Using authenticated session with cookies")
-        kwargs["http_client"] = http_client
-    
+    transcript = None
+    desc = ""
+
+    # First attempt: with proxy (if configured)
     if proxy_config:
-        logger.info(f"[Tier 1] Using proxy: {proxy_config.https_url}")
-        kwargs["proxy_config"] = proxy_config
-        
-    ytt = YouTubeTranscriptApi(**kwargs)
-        
-    transcript = ytt.fetch(video_id, languages=languages)
+        try:
+            logger.info(f"[Tier 1] Trying with proxy: {proxy_config.https_url}")
+            transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=True)
+        except Exception as proxy_err:
+            logger.warning(f"[Tier 1] Proxy attempt failed: {type(proxy_err).__name__}: {proxy_err}")
+            # Retry without proxy
+            logger.info("[Tier 1] Retrying without proxy...")
+            transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=False)
+    else:
+        transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=False)
 
     # Convert to raw data format (list of dicts with text, start, duration)
     snippets = transcript.to_raw_data()
@@ -207,7 +238,7 @@ def _fetch_youtube_captions(
     detected_language = transcript.language_code or language or "en"
 
     logger.info(
-        f"[Tier 1] SUCCESS - Got {len(snippets)} segments, "
+        f"[Tier 1] SUCCESS ({desc}) - Got {len(snippets)} segments, "
         f"language: {detected_language}, "
         f"generated: {transcript.is_generated}, "
         f"estimated duration: {duration}s"
@@ -506,7 +537,6 @@ def get_transcript(
     except (VideoNotFoundError, VideoUnavailableError) as e:
         tier2_error = e
         logger.warning(f"[Tier 2] Video error: {e}")
-        # Don't re-raise yet, try Tier 3
     except DownloadError as e:
         tier2_error = e
         logger.warning(f"[Tier 2] yt-dlp download failed: {e}")
@@ -518,7 +548,6 @@ def get_transcript(
         logger.warning(f"[Tier 2] Unexpected error: {type(e).__name__}: {e}")
 
     # --- Tier 3: pytubefix + AssemblyAI ---
-    # pytubefix uses a different implementation that may succeed when yt-dlp fails
     try:
         return _fetch_with_pytubefix_assemblyai(
             video_id=video_id,

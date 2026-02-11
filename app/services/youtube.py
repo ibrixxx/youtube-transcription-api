@@ -129,10 +129,10 @@ def get_common_ydl_opts():
         # Enable remote JS challenge solver (required for YouTube 2025+)
         # Downloads solver from GitHub to handle YouTube's signature challenges
         "remote_components": ["ejs:github"],
-        # Increased sleep intervals to avoid rate limiting
-        "sleep_interval": 3,
-        "max_sleep_interval": 10,
-        "sleep_interval_requests": 2,  # Sleep between playlist/channel requests
+        # Configurable sleep intervals (low values fine for single-video requests)
+        "sleep_interval": settings.ytdlp_sleep_interval,
+        "max_sleep_interval": settings.ytdlp_max_sleep_interval,
+        "sleep_interval_requests": settings.ytdlp_sleep_interval_requests,
         # Geographic bypass to avoid region locks
         "geo_bypass": True,
         # Enhanced player client selection - try clients that rarely trigger bot detection first
@@ -155,11 +155,11 @@ def get_common_ydl_opts():
         "file_access_retries": 3,
     }
 
-    # Proxy priority: Webshare (residential) > Tor > No proxy
-    if settings.webshare_proxy_enabled and settings.webshare_proxy_url:
-        opts["proxy"] = settings.webshare_proxy_url
-        print("[yt-dlp] Using Webshare residential proxy")
-        logger.info("[yt-dlp] Using Webshare residential proxy")
+    # Proxy priority: Residential proxy > Tor > No proxy
+    if settings.proxy_enabled and settings.proxy_url:
+        opts["proxy"] = settings.proxy_url
+        print("[yt-dlp] Using residential proxy")
+        logger.info("[yt-dlp] Using residential proxy")
     elif settings.tor_proxy_enabled:
         opts["proxy"] = settings.tor_proxy_url
         print(f"[yt-dlp] Using Tor proxy (fallback): {settings.tor_proxy_url}")
@@ -397,14 +397,12 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
     # yt-dlp options with anti-bot detection measures
     ydl_opts = {
         **get_common_ydl_opts(),
-        "format": "bestaudio*/best",  # Very flexible - any audio or best overall
+        # Use lowest quality audio - speech transcription doesn't need high bitrate
+        # This cuts bandwidth from ~150MB to ~15-30MB per video (5-10x reduction)
+        "format": "worstaudio[ext=m4a]/worstaudio/bestaudio[ext=m4a]/bestaudio*/best",
         "outtmpl": output_template,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "m4a",
-            }
-        ],
+        # No postprocessors - skip FFmpeg re-encoding (saves 5-30s)
+        # AssemblyAI accepts webm, opus, m4a, mp4, mp3 natively
     }
 
     try:
@@ -414,20 +412,15 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
             if info is None:
                 raise VideoNotFoundError(f"Video not found: {video_id}")
 
-            # Determine the output file path
-            # After FFmpegExtractAudio, the extension will be .m4a
-            audio_path = os.path.join(output_dir, f"{video_id}.m4a")
+            # Find the downloaded file (extension depends on what YouTube provides)
+            audio_path = None
+            for ext in ["m4a", "webm", "opus", "mp4", "mp3", "ogg", "wav"]:
+                potential_path = os.path.join(output_dir, f"{video_id}.{ext}")
+                if os.path.exists(potential_path):
+                    audio_path = potential_path
+                    break
 
-            # Check if file exists, might be different extension
-            if not os.path.exists(audio_path):
-                # Try to find the downloaded file
-                for ext in ["m4a", "webm", "mp4", "mp3", "opus"]:
-                    potential_path = os.path.join(output_dir, f"{video_id}.{ext}")
-                    if os.path.exists(potential_path):
-                        audio_path = potential_path
-                        break
-
-            if not os.path.exists(audio_path):
+            if audio_path is None:
                 raise DownloadError(f"Failed to download audio for video: {video_id}")
 
             metadata = {
@@ -507,22 +500,25 @@ def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> t
         output_dir = tempfile.mkdtemp()
 
     # Configure proxy for pytubefix
-    # Webshare provides HTTP proxies which pytubefix supports natively
     settings = get_settings()
     proxies = None
-    if settings.webshare_proxy_enabled and settings.webshare_proxy_url:
-        proxies = {"http": settings.webshare_proxy_url, "https": settings.webshare_proxy_url}
-        logger.info("[pytubefix] Using Webshare residential proxy")
-        print("[pytubefix] Using Webshare residential proxy")
+    if settings.proxy_enabled and settings.proxy_url:
+        proxies = {"http": settings.proxy_url, "https": settings.proxy_url}
+        logger.info("[pytubefix] Using residential proxy")
+        print("[pytubefix] Using residential proxy")
 
-    # Try multiple client types - different clients have different success rates
-    # WEB: Uses BotGuard to auto-generate Proof of Origin token (requires Node.js)
-    # ANDROID: Mobile client, often less restricted
-    # IOS: iOS client, different fingerprint
-    # None: Default client (no special handling)
-    clients_to_try = ['WEB', 'ANDROID', 'IOS', None]
+    # Try client types with highest success rates
+    # ANDROID: Mobile client, highest success rate, often less restricted
+    # WEB: Uses BotGuard for Proof of Origin token (requires Node.js)
+    # IOS and default rarely succeed when the first two fail
+    clients_to_try = ['ANDROID', 'WEB']
 
     last_error = None
+
+    def _abr_kbps(stream) -> int:
+        abr = stream.abr or ""
+        match = re.match(r"(\d+)", abr)
+        return int(match.group(1)) if match else 10**9
 
     for client in clients_to_try:
         client_name = client or "default"
@@ -536,18 +532,17 @@ def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> t
             else:
                 yt = YouTube(normalized_url, proxies=proxies)
 
-            # Get audio-only stream (best quality)
-            audio_stream = yt.streams.get_audio_only()
-            if not audio_stream:
-                # Try to get any audio stream
-                audio_stream = yt.streams.filter(only_audio=True).first()
-
-            if not audio_stream:
+            # Get lowest-bitrate audio-only stream (reduces bandwidth)
+            streams = list(yt.streams.filter(only_audio=True))
+            if not streams:
                 logger.warning(f"[pytubefix] No audio stream with {client_name} client")
                 continue
 
+            audio_stream = min(streams, key=_abr_kbps)
+
             # Download the audio
-            output_filename = f"{video_id}.m4a"
+            output_ext = audio_stream.subtype or "m4a"
+            output_filename = f"{video_id}.{output_ext}"
             audio_path = audio_stream.download(
                 output_path=output_dir,
                 filename=output_filename,
