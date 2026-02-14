@@ -137,12 +137,13 @@ def get_common_ydl_opts():
 
     Player client priority (2026):
     1. android_vr - VR client, often less restricted, works well without POT
-    2. web_embedded - Embedded player, lightweight
-    3. ios - mobile client, may bypass some restrictions
-    4. mweb - works best with POT tokens (if POT is available)
-    5. android - mobile fallback
-    6. web_safari - provides HLS formats
-    7. web - last resort
+    2. mweb - works best with POT tokens (if POT is available)
+    3. android - mobile fallback
+    4. web_safari - provides HLS formats
+    5. web - last resort
+
+    Removed: web_embedded (crashes yt-dlp nightly with INNERTUBE_CONTEXT error),
+    ios (logged as "Skipping unsupported client" in nightly).
 
     NOTE: Do NOT set custom http_headers (User-Agent etc). yt-dlp sets
     per-client User-Agents internally. A mismatched User-Agent + TLS
@@ -186,15 +187,15 @@ def get_common_ydl_opts():
         # Player client selection - android_vr first as it's least restricted
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "web_embedded", "ios", "mweb", "android", "web_safari", "web"],
+                "player_client": ["android_vr", "mweb", "android", "web_safari", "web"],
             }
         },
         # Do NOT set http_headers — yt-dlp sets per-client User-Agents internally.
         # A custom User-Agent with Python's TLS fingerprint triggers bot detection.
         # Retry configuration for transient failures
-        "retries": 5,
-        "fragment_retries": 5,
-        "file_access_retries": 3,
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 2,
     }
 
     # Proxy priority: Webshare > Residential > Tor > No proxy
@@ -419,43 +420,6 @@ def get_video_metadata(video_url: str) -> dict[str, Any]:
                     e = retry_err
                     error_msg = str(e).lower()
 
-            # Fall through: retry without proxy and cookies (direct connection)
-            if _is_innertube_context_error(error_msg):
-                has_proxy = ydl_opts.get("proxy") not in ("", None)
-                has_cookies = ydl_opts.get("cookiefile") is not None
-                if has_proxy or has_cookies:
-                    logger.warning("[yt-dlp] INNERTUBE error; retrying metadata without proxy and cookies")
-                    try:
-                        clean_opts = dict(ydl_opts)
-                        clean_opts["proxy"] = ""
-                        clean_opts["cookiefile"] = None
-                        info = _extract_with_opts(clean_opts)
-                        if info is None:
-                            raise VideoNotFoundError(f"Video not found: {video_id}")
-                        logger.info(f"Got metadata via yt-dlp without proxy/cookies for {video_id}")
-                        return _build_metadata(info)
-                    except yt_dlp.utils.DownloadError as retry_err:
-                        e = retry_err
-                        error_msg = str(e).lower()
-
-        # If INNERTUBE still fails, try Tor as last resort
-        if _is_innertube_context_error(error_msg):
-            settings = get_settings()
-            if settings.tor_proxy_enabled:
-                logger.warning("[yt-dlp] INNERTUBE persists; retrying metadata with Tor proxy")
-                try:
-                    tor_opts = dict(ydl_opts)
-                    tor_opts["proxy"] = settings.tor_proxy_url
-                    tor_opts["cookiefile"] = None
-                    info = _extract_with_opts(tor_opts)
-                    if info is None:
-                        raise VideoNotFoundError(f"Video not found: {video_id}")
-                    logger.info(f"Got metadata via yt-dlp with Tor for {video_id}")
-                    return _build_metadata(info)
-                except yt_dlp.utils.DownloadError as retry_err:
-                    e = retry_err
-                    error_msg = str(e).lower()
-
         # Check for definitive errors that won't be fixed by oEmbed
         if "private" in error_msg:
             raise VideoUnavailableError(f"Video is private: {video_id}")
@@ -524,7 +488,7 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
         **get_common_ydl_opts(),
         # Use lowest quality audio - speech transcription doesn't need high bitrate
         # This cuts bandwidth from ~150MB to ~15-30MB per video (5-10x reduction)
-        "format": "worstaudio[ext=m4a]/worstaudio/bestaudio[ext=m4a]/bestaudio*/best",
+        "format": "worstaudio[ext=m4a]/worstaudio",
         "outtmpl": output_template,
         # No postprocessors - skip FFmpeg re-encoding (saves 5-30s)
         # AssemblyAI accepts webm, opus, m4a, mp4, mp3 natively
@@ -586,35 +550,6 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
                     webshare_opts["proxy"] = settings.webshare_http_proxy_url
                     webshare_opts["cookiefile"] = None
                     return _download_with_opts(webshare_opts)
-                except yt_dlp.utils.DownloadError as retry_err:
-                    e = retry_err
-                    error_msg = str(e)
-
-            # Fall through: retry without proxy and cookies (direct connection)
-            if _is_innertube_context_error(error_msg):
-                has_proxy = ydl_opts.get("proxy") not in ("", None)
-                has_cookies = ydl_opts.get("cookiefile") is not None
-                if has_proxy or has_cookies:
-                    logger.warning("[yt-dlp] INNERTUBE error; retrying without proxy and cookies")
-                    try:
-                        clean_opts = dict(ydl_opts)
-                        clean_opts["proxy"] = ""
-                        clean_opts["cookiefile"] = None
-                        return _download_with_opts(clean_opts)
-                    except yt_dlp.utils.DownloadError as retry_err:
-                        e = retry_err
-                        error_msg = str(e)
-
-        # If INNERTUBE still fails, try Tor as last resort
-        if _is_innertube_context_error(error_msg):
-            settings = get_settings()
-            if settings.tor_proxy_enabled:
-                logger.warning("[yt-dlp] INNERTUBE persists; retrying download with Tor proxy")
-                try:
-                    tor_opts = dict(ydl_opts)
-                    tor_opts["proxy"] = settings.tor_proxy_url
-                    tor_opts["cookiefile"] = None
-                    return _download_with_opts(tor_opts)
                 except yt_dlp.utils.DownloadError as retry_err:
                     e = retry_err
                     error_msg = str(e)
