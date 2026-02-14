@@ -87,19 +87,66 @@ _cookies_exist = os.path.exists(COOKIES_FILE)
 _cookies_valid = _has_youtube_cookies(COOKIES_FILE) if _cookies_exist else False
 print(f"[youtube] Cookies file: {COOKIES_FILE}, exists: {_cookies_exist}, valid: {_cookies_valid}")
 
+
+def _cookies_valid_now() -> bool:
+    """Check cookies file validity at call time (supports hot updates)."""
+    return _has_youtube_cookies(COOKIES_FILE)
+
+
+def _is_proxy_error(error_msg: str) -> bool:
+    """Detect proxy-related failures in yt-dlp/pytube errors."""
+    error_lower = error_msg.lower()
+    return (
+        "proxy" in error_lower
+        or "tunnel connection failed" in error_lower
+        or "proxy authentication required" in error_lower
+        or " 407 " in f" {error_lower} "
+    )
+
+
+def _is_innertube_context_error(error_msg: str) -> bool:
+    """Detect yt-dlp extractor errors related to missing INNERTUBE_CONTEXT."""
+    error_lower = error_msg.lower()
+    return (
+        "innertube_context" in error_lower
+        or "extractor error" in error_lower
+        or "failed to extract" in error_lower
+        or "initial player response" in error_lower
+        or "player response" in error_lower
+    )
+
+
+def _ydl_opts_without_proxy(ydl_opts: dict) -> dict:
+    """Return a copy of yt-dlp opts with proxies explicitly disabled."""
+    opts = dict(ydl_opts)
+    # yt-dlp treats empty string as "no proxy"
+    opts["proxy"] = ""
+    return opts
+
+
+def _ydl_opts_without_cookies(ydl_opts: dict) -> dict:
+    """Return a copy of yt-dlp opts with cookies disabled."""
+    opts = dict(ydl_opts)
+    opts["cookiefile"] = None
+    return opts
+
 # Common yt-dlp options to avoid bot detection
 def get_common_ydl_opts():
     """
     Get common yt-dlp options with enhanced anti-bot detection measures.
 
-    Player client priority (2025):
-    1. tv_embedded - Rarely triggers bot detection, works for most videos
-    2. ios - Mobile iOS client, different fingerprint than web
-    3. android_vr - VR client, often less restricted
+    Player client priority (2026):
+    1. android_vr - VR client, often less restricted, works well without POT
+    2. web_embedded - Embedded player, lightweight
+    3. ios - mobile client, may bypass some restrictions
     4. mweb - works best with POT tokens (if POT is available)
     5. android - mobile fallback
     6. web_safari - provides HLS formats
     7. web - last resort
+
+    NOTE: Do NOT set custom http_headers (User-Agent etc). yt-dlp sets
+    per-client User-Agents internally. A mismatched User-Agent + TLS
+    fingerprint is a strong bot detection signal.
     """
     settings = get_settings()
 
@@ -122,41 +169,40 @@ def get_common_ydl_opts():
     # Note: curl_cffi was removed - the impersonate feature requires native deps
     # that don't work reliably in Docker containers
 
+    cookies_valid = _cookies_valid_now()
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "cookiefile": COOKIES_FILE if _cookies_valid else None,
+        "cookiefile": COOKIES_FILE if cookies_valid else None,
         # Enable remote JS challenge solver (required for YouTube 2025+)
         # Downloads solver from GitHub to handle YouTube's signature challenges
         "remote_components": ["ejs:github"],
-        # Configurable sleep intervals (low values fine for single-video requests)
+        # Configurable sleep intervals
         "sleep_interval": settings.ytdlp_sleep_interval,
         "max_sleep_interval": settings.ytdlp_max_sleep_interval,
         "sleep_interval_requests": settings.ytdlp_sleep_interval_requests,
         # Geographic bypass to avoid region locks
         "geo_bypass": True,
-        # Enhanced player client selection - try clients that rarely trigger bot detection first
+        # Player client selection - android_vr first as it's least restricted
         "extractor_args": {
             "youtube": {
-                # Extended client list with android_vr which is often less restricted
-                "player_client": ["tv_embedded", "ios", "android_vr", "mweb", "android", "web_safari", "web"],
+                "player_client": ["android_vr", "web_embedded", "ios", "mweb", "android", "web_safari", "web"],
             }
         },
-        # Mobile-like headers to appear more legitimate
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-        },
+        # Do NOT set http_headers — yt-dlp sets per-client User-Agents internally.
+        # A custom User-Agent with Python's TLS fingerprint triggers bot detection.
         # Retry configuration for transient failures
         "retries": 5,
         "fragment_retries": 5,
         "file_access_retries": 3,
     }
 
-    # Proxy priority: Residential proxy > Tor > No proxy
-    if settings.proxy_enabled and settings.proxy_url:
+    # Proxy priority: Webshare > Residential > Tor > No proxy
+    if settings.webshare_proxy_enabled and settings.webshare_proxy_username:
+        opts["proxy"] = settings.webshare_http_proxy_url
+        print("[yt-dlp] Using Webshare rotating residential proxy")
+        logger.info("[yt-dlp] Using Webshare rotating residential proxy")
+    elif settings.proxy_enabled and settings.proxy_url:
         opts["proxy"] = settings.proxy_url
         print("[yt-dlp] Using residential proxy")
         logger.info("[yt-dlp] Using residential proxy")
@@ -308,29 +354,108 @@ def get_video_metadata(video_url: str) -> dict[str, Any]:
         "skip_download": True,
     }
 
+    def _build_metadata(info: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "video_id": video_id,
+            "title": info.get("title", "Unknown"),
+            "channel_name": info.get("uploader", info.get("channel", "Unknown")),
+            "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+            "thumbnail_small": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+            "duration": info.get("duration", 0),
+            "view_count": info.get("view_count"),
+            "upload_date": info.get("upload_date"),
+            "description": (info.get("description") or "")[:500],
+        }
+
+    def _extract_with_opts(opts: dict[str, Any]) -> dict[str, Any] | None:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(normalized_url, download=False)
+
     # Try yt-dlp first (gives us duration and more metadata)
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(normalized_url, download=False)
+        info = _extract_with_opts(ydl_opts)
 
-            if info is None:
-                raise VideoNotFoundError(f"Video not found: {video_id}")
+        if info is None:
+            raise VideoNotFoundError(f"Video not found: {video_id}")
 
-            logger.info(f"Got metadata via yt-dlp for {video_id}")
-            return {
-                "video_id": video_id,
-                "title": info.get("title", "Unknown"),
-                "channel_name": info.get("uploader", info.get("channel", "Unknown")),
-                "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-                "thumbnail_small": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
-                "duration": info.get("duration", 0),
-                "view_count": info.get("view_count"),
-                "upload_date": info.get("upload_date"),
-                "description": (info.get("description") or "")[:500],
-            }
+        logger.info(f"Got metadata via yt-dlp for {video_id}")
+        return _build_metadata(info)
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e).lower()
+
+        # Proxy failures are common (407, tunnel errors). Retry once without proxy.
+        if _is_proxy_error(error_msg) and ydl_opts.get("proxy") != "":
+            logger.warning("yt-dlp proxy error while fetching metadata; retrying without proxy")
+            try:
+                info = _extract_with_opts(_ydl_opts_without_proxy(ydl_opts))
+                if info is None:
+                    raise VideoNotFoundError(f"Video not found: {video_id}")
+                logger.info(f"Got metadata via yt-dlp without proxy for {video_id}")
+                return _build_metadata(info)
+            except yt_dlp.utils.DownloadError as retry_err:
+                e = retry_err
+                error_msg = str(e).lower()
+
+        # INNERTUBE_CONTEXT errors are often caused by proxy returning consent/bot
+        # pages or stale cookies.
+        if _is_innertube_context_error(error_msg):
+            settings = get_settings()
+
+            # If Webshare is active, retry WITH Webshare but without cookies.
+            # The -rotate endpoint gives a fresh residential IP each connection.
+            if settings.webshare_proxy_enabled and settings.webshare_proxy_username:
+                logger.warning("[yt-dlp] INNERTUBE error; retrying metadata with Webshare proxy (no cookies)")
+                try:
+                    webshare_opts = dict(ydl_opts)
+                    webshare_opts["proxy"] = settings.webshare_http_proxy_url
+                    webshare_opts["cookiefile"] = None
+                    info = _extract_with_opts(webshare_opts)
+                    if info is None:
+                        raise VideoNotFoundError(f"Video not found: {video_id}")
+                    logger.info(f"Got metadata via yt-dlp with Webshare (no cookies) for {video_id}")
+                    return _build_metadata(info)
+                except yt_dlp.utils.DownloadError as retry_err:
+                    e = retry_err
+                    error_msg = str(e).lower()
+
+            # Fall through: retry without proxy and cookies (direct connection)
+            if _is_innertube_context_error(error_msg):
+                has_proxy = ydl_opts.get("proxy") not in ("", None)
+                has_cookies = ydl_opts.get("cookiefile") is not None
+                if has_proxy or has_cookies:
+                    logger.warning("[yt-dlp] INNERTUBE error; retrying metadata without proxy and cookies")
+                    try:
+                        clean_opts = dict(ydl_opts)
+                        clean_opts["proxy"] = ""
+                        clean_opts["cookiefile"] = None
+                        info = _extract_with_opts(clean_opts)
+                        if info is None:
+                            raise VideoNotFoundError(f"Video not found: {video_id}")
+                        logger.info(f"Got metadata via yt-dlp without proxy/cookies for {video_id}")
+                        return _build_metadata(info)
+                    except yt_dlp.utils.DownloadError as retry_err:
+                        e = retry_err
+                        error_msg = str(e).lower()
+
+        # If INNERTUBE still fails, try Tor as last resort
+        if _is_innertube_context_error(error_msg):
+            settings = get_settings()
+            if settings.tor_proxy_enabled:
+                logger.warning("[yt-dlp] INNERTUBE persists; retrying metadata with Tor proxy")
+                try:
+                    tor_opts = dict(ydl_opts)
+                    tor_opts["proxy"] = settings.tor_proxy_url
+                    tor_opts["cookiefile"] = None
+                    info = _extract_with_opts(tor_opts)
+                    if info is None:
+                        raise VideoNotFoundError(f"Video not found: {video_id}")
+                    logger.info(f"Got metadata via yt-dlp with Tor for {video_id}")
+                    return _build_metadata(info)
+                except yt_dlp.utils.DownloadError as retry_err:
+                    e = retry_err
+                    error_msg = str(e).lower()
+
         # Check for definitive errors that won't be fixed by oEmbed
         if "private" in error_msg:
             raise VideoUnavailableError(f"Video is private: {video_id}")
@@ -405,8 +530,8 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
         # AssemblyAI accepts webm, opus, m4a, mp4, mp3 natively
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    def _download_with_opts(opts: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(normalized_url, download=True)
 
             if info is None:
@@ -433,8 +558,67 @@ def download_audio(video_url: str, output_dir: str | None = None) -> tuple[str, 
 
             return audio_path, metadata
 
+    try:
+        return _download_with_opts(ydl_opts)
+
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
+
+        # Proxy failures are common (407, tunnel errors). Retry once without proxy.
+        if _is_proxy_error(error_msg) and ydl_opts.get("proxy") != "":
+            logger.warning("yt-dlp proxy error while downloading audio; retrying without proxy")
+            try:
+                return _download_with_opts(_ydl_opts_without_proxy(ydl_opts))
+            except yt_dlp.utils.DownloadError as retry_err:
+                e = retry_err
+                error_msg = str(e)
+        # INNERTUBE_CONTEXT errors are often caused by proxy returning consent/bot
+        # pages or stale cookies.
+        if _is_innertube_context_error(error_msg):
+            settings = get_settings()
+
+            # If Webshare is active, retry WITH Webshare but without cookies.
+            # The -rotate endpoint gives a fresh residential IP each connection.
+            if settings.webshare_proxy_enabled and settings.webshare_proxy_username:
+                logger.warning("[yt-dlp] INNERTUBE error; retrying with Webshare proxy (no cookies)")
+                try:
+                    webshare_opts = dict(ydl_opts)
+                    webshare_opts["proxy"] = settings.webshare_http_proxy_url
+                    webshare_opts["cookiefile"] = None
+                    return _download_with_opts(webshare_opts)
+                except yt_dlp.utils.DownloadError as retry_err:
+                    e = retry_err
+                    error_msg = str(e)
+
+            # Fall through: retry without proxy and cookies (direct connection)
+            if _is_innertube_context_error(error_msg):
+                has_proxy = ydl_opts.get("proxy") not in ("", None)
+                has_cookies = ydl_opts.get("cookiefile") is not None
+                if has_proxy or has_cookies:
+                    logger.warning("[yt-dlp] INNERTUBE error; retrying without proxy and cookies")
+                    try:
+                        clean_opts = dict(ydl_opts)
+                        clean_opts["proxy"] = ""
+                        clean_opts["cookiefile"] = None
+                        return _download_with_opts(clean_opts)
+                    except yt_dlp.utils.DownloadError as retry_err:
+                        e = retry_err
+                        error_msg = str(e)
+
+        # If INNERTUBE still fails, try Tor as last resort
+        if _is_innertube_context_error(error_msg):
+            settings = get_settings()
+            if settings.tor_proxy_enabled:
+                logger.warning("[yt-dlp] INNERTUBE persists; retrying download with Tor proxy")
+                try:
+                    tor_opts = dict(ydl_opts)
+                    tor_opts["proxy"] = settings.tor_proxy_url
+                    tor_opts["cookiefile"] = None
+                    return _download_with_opts(tor_opts)
+                except yt_dlp.utils.DownloadError as retry_err:
+                    e = retry_err
+                    error_msg = str(e)
+
         error_class = classify_youtube_error(error_msg)
 
         if error_class == YouTubeBlockedError:
@@ -500,18 +684,25 @@ def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> t
         output_dir = tempfile.mkdtemp()
 
     # Configure proxy for pytubefix
+    # Priority: Webshare > Residential > None
     settings = get_settings()
     proxies = None
-    if settings.proxy_enabled and settings.proxy_url:
+    if settings.webshare_proxy_enabled and settings.webshare_proxy_username:
+        webshare_url = settings.webshare_http_proxy_url
+        proxies = {"http": webshare_url, "https": webshare_url}
+        logger.info("[pytubefix] Using Webshare rotating residential proxy")
+        print("[pytubefix] Using Webshare rotating residential proxy")
+    elif settings.proxy_enabled and settings.proxy_url:
         proxies = {"http": settings.proxy_url, "https": settings.proxy_url}
         logger.info("[pytubefix] Using residential proxy")
         print("[pytubefix] Using residential proxy")
+    no_proxy = {"http": None, "https": None}
 
     # Try client types with highest success rates
     # ANDROID: Mobile client, highest success rate, often less restricted
     # WEB: Uses BotGuard for Proof of Origin token (requires Node.js)
     # IOS and default rarely succeed when the first two fail
-    clients_to_try = ['ANDROID', 'WEB']
+    clients_to_try = ['ANDROID', 'WEB', 'IOS']
 
     last_error = None
 
@@ -520,73 +711,125 @@ def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> t
         match = re.match(r"(\d+)", abr)
         return int(match.group(1)) if match else 10**9
 
-    for client in clients_to_try:
-        client_name = client or "default"
-        logger.info(f"[pytubefix] Trying {client_name} client for video: {video_id}")
-        print(f"[pytubefix] Trying {client_name} client for video: {video_id}")
+    def _attempt_with_proxy(
+        proxy_label: str, proxy_config: dict[str, str] | None
+    ) -> tuple[tuple[str, dict[str, Any]] | None, bool]:
+        """
+        Try all clients with a given proxy config.
+        Returns (result, proxy_error_seen).
+        """
+        nonlocal last_error
+        proxy_error_seen = False
 
-        try:
-            # Create YouTube object with specific client and optional proxy
-            if client:
-                yt = YouTube(normalized_url, client, proxies=proxies)
-            else:
-                yt = YouTube(normalized_url, proxies=proxies)
-
-            # Get lowest-bitrate audio-only stream (reduces bandwidth)
-            streams = list(yt.streams.filter(only_audio=True))
-            if not streams:
-                logger.warning(f"[pytubefix] No audio stream with {client_name} client")
-                continue
-
-            audio_stream = min(streams, key=_abr_kbps)
-
-            # Download the audio
-            output_ext = audio_stream.subtype or "m4a"
-            output_filename = f"{video_id}.{output_ext}"
-            audio_path = audio_stream.download(
-                output_path=output_dir,
-                filename=output_filename,
+        for client in clients_to_try:
+            client_name = client or "default"
+            logger.info(
+                f"[pytubefix] Trying {client_name} client ({proxy_label}) for video: {video_id}"
             )
+            print(f"[pytubefix] Trying {client_name} client ({proxy_label}) for video: {video_id}")
 
-            # Verify file exists
-            if not os.path.exists(audio_path):
-                logger.warning(f"[pytubefix] Download completed but file not found with {client_name}")
+            try:
+                # Create YouTube object with specific client and optional proxy
+                if client:
+                    yt = YouTube(
+                        normalized_url,
+                        client,
+                        proxies=proxy_config,
+                        use_po_token=(client == 'WEB'),
+                    )
+                else:
+                    yt = YouTube(normalized_url, proxies=proxy_config)
+
+                # Get lowest-bitrate audio-only stream (reduces bandwidth)
+                streams = list(yt.streams.filter(only_audio=True))
+                if not streams:
+                    logger.warning(f"[pytubefix] No audio stream with {client_name} client")
+                    continue
+
+                audio_stream = min(streams, key=_abr_kbps)
+
+                # Download the audio
+                output_ext = audio_stream.subtype or "m4a"
+                output_filename = f"{video_id}.{output_ext}"
+                audio_path = audio_stream.download(
+                    output_path=output_dir,
+                    filename=output_filename,
+                )
+
+                # Verify file exists
+                if not os.path.exists(audio_path):
+                    logger.warning(
+                        f"[pytubefix] Download completed but file not found with {client_name}"
+                    )
+                    continue
+
+                metadata = {
+                    "video_id": video_id,
+                    "title": yt.title or "Unknown",
+                    "channel_name": yt.author or "Unknown",
+                    "thumbnail": yt.thumbnail_url
+                    or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                    "duration": yt.length or 0,
+                }
+
+                logger.info(
+                    f"[pytubefix] Successfully downloaded with {client_name} client: {audio_path}"
+                )
+                return (audio_path, metadata), proxy_error_seen
+
+            except PTVideoUnavailable as e:
+                logger.warning(f"[pytubefix] Video unavailable with {client_name}: {e}")
+                last_error = e
+                continue
+            except AgeRestrictedError as e:
+                # Age restriction is the same across all clients
+                logger.warning(f"[pytubefix] Age restricted video: {e}")
+                raise YouTubeCookiesRequiredError(
+                    f"Age-restricted video requires authentication: {video_id}"
+                )
+            except RegexMatchError as e:
+                logger.warning(f"[pytubefix] Regex match error with {client_name}: {e}")
+                last_error = e
+                continue
+            except Exception as e:
+                error_msg = str(e).lower()
+                logger.warning(f"[pytubefix] Error with {client_name} client: {e}")
+                last_error = e
+
+                if _is_proxy_error(error_msg):
+                    proxy_error_seen = True
+
+                # Some errors are definitive - don't try other clients
+                if "private" in error_msg:
+                    raise VideoUnavailableError(f"Video is private: {video_id}")
+
+                # Continue to try other clients
                 continue
 
-            metadata = {
-                "video_id": video_id,
-                "title": yt.title or "Unknown",
-                "channel_name": yt.author or "Unknown",
-                "thumbnail": yt.thumbnail_url or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-                "duration": yt.length or 0,
-            }
+        return None, proxy_error_seen
 
-            logger.info(f"[pytubefix] Successfully downloaded with {client_name} client: {audio_path}")
-            return audio_path, metadata
+    # First attempt: configured proxy (if any) or direct
+    if proxies:
+        result, _ = _attempt_with_proxy("proxy", proxies)
+        if result:
+            return result
 
-        except PTVideoUnavailable as e:
-            logger.warning(f"[pytubefix] Video unavailable with {client_name}: {e}")
-            last_error = e
-            continue
-        except AgeRestrictedError as e:
-            # Age restriction is the same across all clients
-            logger.warning(f"[pytubefix] Age restricted video: {e}")
-            raise YouTubeCookiesRequiredError(f"Age-restricted video requires authentication: {video_id}")
-        except RegexMatchError as e:
-            logger.warning(f"[pytubefix] Regex match error with {client_name}: {e}")
-            last_error = e
-            continue
-        except Exception as e:
-            error_msg = str(e).lower()
-            logger.warning(f"[pytubefix] Error with {client_name} client: {e}")
-            last_error = e
+        # Proxy failed - retry without proxy to avoid 407/auth issues
+        logger.warning("[pytubefix] Proxy attempt failed; retrying without proxy")
+        result, _ = _attempt_with_proxy("no-proxy", no_proxy)
+        if result:
+            return result
+    else:
+        result, proxy_error_seen = _attempt_with_proxy("direct", None)
+        if result:
+            return result
 
-            # Some errors are definitive - don't try other clients
-            if "private" in error_msg:
-                raise VideoUnavailableError(f"Video is private: {video_id}")
-
-            # Continue to try other clients
-            continue
+        # If we hit proxy errors from env vars, retry with proxies disabled
+        if proxy_error_seen:
+            logger.warning("[pytubefix] Proxy error detected; retrying without proxy")
+            result, _ = _attempt_with_proxy("no-proxy", no_proxy)
+            if result:
+                return result
 
     # All clients failed
     error_msg = str(last_error).lower() if last_error else ""

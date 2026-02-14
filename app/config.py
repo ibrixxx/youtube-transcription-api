@@ -25,16 +25,19 @@ class Settings(BaseSettings):
     # yt-dlp sleep intervals (low values are fine for single-video requests)
     ytdlp_sleep_interval: int = 0
     ytdlp_max_sleep_interval: int = 2
-    ytdlp_sleep_interval_requests: int = 0
+    ytdlp_sleep_interval_requests: int = 2
 
-    # Residential proxy (primary - for YouTube downloads)
+    # Webshare rotating residential proxy (recommended - highest success rate)
+    # Sign up at https://proxy2.webshare.io/ — Residential proxies ~$1.40/GB
+    # 80M+ rotating IPs, officially recommended by youtube-transcript-api
+    webshare_proxy_enabled: bool = False
+    webshare_proxy_username: str = ""
+    webshare_proxy_password: str = ""
+
+    # Residential proxy (legacy - for YouTube downloads)
     # Format: http://username:password@proxy-host:port
     residential_proxy_enabled: bool = False
     residential_proxy_url: str = ""
-
-    # Legacy aliases for backward compatibility with .env files
-    webshare_proxy_enabled: bool = False
-    webshare_proxy_url: str = ""
 
     # Tor proxy settings (fallback when residential proxy not configured)
     # Using socks5h:// ensures DNS is also resolved through the proxy
@@ -47,13 +50,18 @@ class Settings(BaseSettings):
 
     @property
     def proxy_enabled(self) -> bool:
-        """Check if residential proxy is enabled (supports both new and legacy env vars)."""
-        return self.residential_proxy_enabled or self.webshare_proxy_enabled
+        """Check if residential proxy is enabled."""
+        return self.residential_proxy_enabled
 
     @property
     def proxy_url(self) -> str:
-        """Get residential proxy URL (supports both new and legacy env vars)."""
-        return self.residential_proxy_url or self.webshare_proxy_url
+        """Get residential proxy URL."""
+        return self.residential_proxy_url
+
+    @property
+    def webshare_http_proxy_url(self) -> str:
+        """Build Webshare HTTP proxy URL for yt-dlp/pytubefix."""
+        return f"http://{self.webshare_proxy_username}-rotate:{self.webshare_proxy_password}@p.webshare.io:80"
 
     @property
     def is_development(self) -> bool:

@@ -163,7 +163,8 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
         except (VideoNotFoundError, VideoUnavailableError) as e:
             return TranscribeResponse(success=False, error=str(e))
         except NoCaptionsAvailableError as e:
-            return TranscribeResponse(success=False, error=str(e))
+            tier1_err = f"Captions: {type(captions_result).__name__}: {captions_result}"
+            return TranscribeResponse(success=False, error=f"{str(e)}; Fast-path {tier1_err}")
 
         logger.info(
             f"Transcript obtained via {result.method.value} "

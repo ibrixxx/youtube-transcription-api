@@ -3,14 +3,14 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
 # YouTube audio extraction
-yt-dlp>=2024.12.13
+yt-dlp>=2026.02.04
 
 # YouTube captions (primary method - no cookies needed)
 youtube-transcript-api>=1.0.0
 
 # Pytubefix - alternative YouTube downloader (fallback when yt-dlp fails)
 # Supports multiple clients (WEB, ANDROID, IOS) and automatic PO Token generation
-pytubefix>=10.3.0
+pytubefix>=10.3.6
 
 # POT (Proof of Origin Token) provider for bypassing bot detection
 # Requires Node.js runtime - generates tokens using Google's BotGuard

@@ -34,6 +34,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Always get the latest yt-dlp nightly (YouTube anti-bot measures change constantly)
+RUN pip install --upgrade --pre --no-cache-dir yt-dlp
+
 # Copy application code
 COPY app/ ./app/
 

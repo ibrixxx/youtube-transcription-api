@@ -17,7 +17,7 @@ from typing import Any
 
 import assemblyai as aai
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import GenericProxyConfig
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
@@ -121,9 +121,24 @@ def _estimate_duration_from_transcript(snippets: list[dict]) -> int | None:
     return int(end_time)
 
 
+def _get_webshare_proxy_config() -> WebshareProxyConfig | None:
+    """
+    Get Webshare rotating residential proxy configuration.
+    Webshare has 80M+ rotating IPs and is officially recommended by youtube-transcript-api.
+    """
+    settings = get_settings()
+    if settings.webshare_proxy_enabled and settings.webshare_proxy_username and settings.webshare_proxy_password:
+        return WebshareProxyConfig(
+            proxy_username=settings.webshare_proxy_username,
+            proxy_password=settings.webshare_proxy_password,
+        )
+    return None
+
+
 def _get_proxy_config() -> GenericProxyConfig | None:
     """
-    Get proxy configuration for youtube-transcript-api.
+    Get residential proxy configuration for youtube-transcript-api.
+    Returns residential proxy only (not Tor). Use _get_tor_proxy_config() for Tor.
     """
     settings = get_settings()
     if settings.proxy_enabled and settings.proxy_url:
@@ -131,6 +146,15 @@ def _get_proxy_config() -> GenericProxyConfig | None:
             http_url=settings.proxy_url,
             https_url=settings.proxy_url,
         )
+    return None
+
+
+def _get_tor_proxy_config() -> GenericProxyConfig | None:
+    """
+    Get Tor proxy configuration for youtube-transcript-api.
+    Independent from residential proxy — used as a last-resort fallback.
+    """
+    settings = get_settings()
     if settings.tor_proxy_enabled:
         return GenericProxyConfig(
             http_url=settings.tor_proxy_url,
@@ -157,6 +181,18 @@ def _get_http_client() -> requests.Session | None:
         return None
 
 
+def _is_innertube_context_error(error_msg: str) -> bool:
+    """Detect yt-dlp extractor errors related to missing INNERTUBE_CONTEXT."""
+    error_lower = error_msg.lower()
+    return (
+        "innertube_context" in error_lower
+        or "extractor error" in error_lower
+        or "failed to extract" in error_lower
+        or "initial player response" in error_lower
+        or "player response" in error_lower
+    )
+
+
 def _try_fetch_captions(
     video_id: str,
     languages: list[str],
@@ -178,6 +214,28 @@ def _try_fetch_captions(
         kwargs["proxy_config"] = proxy_config
 
     desc = "with proxy" if proxy_config else "without proxy"
+    ytt = YouTubeTranscriptApi(**kwargs)
+    transcript = ytt.fetch(video_id, languages=languages)
+    return transcript, desc
+
+
+def _try_fetch_captions_with_config(
+    video_id: str,
+    languages: list[str],
+    proxy_config: GenericProxyConfig,
+) -> "tuple[Any, str]":
+    """
+    Attempt to fetch captions with an explicit proxy config (e.g. Tor).
+
+    Returns:
+        Tuple of (transcript object, description string for logging)
+    """
+    kwargs = {"proxy_config": proxy_config}
+    http_client = _get_http_client()
+    if http_client:
+        kwargs["http_client"] = http_client
+
+    desc = "with Tor" if "socks" in str(getattr(proxy_config, "https_url", "")) else "with proxy"
     ytt = YouTubeTranscriptApi(**kwargs)
     transcript = ytt.fetch(video_id, languages=languages)
     return transcript, desc
@@ -207,23 +265,53 @@ def _fetch_youtube_captions(
     logger.info(f"[Tier 1] Attempting youtube-transcript-api for video: {video_id}")
 
     languages = _get_preferred_languages(language)
-    proxy_config = _get_proxy_config()
+    webshare_proxy = _get_webshare_proxy_config()  # webshare or None
+    residential_proxy = _get_proxy_config()        # residential or None
+    tor_proxy = _get_tor_proxy_config()            # tor or None (independent)
+    errors = []
 
     transcript = None
     desc = ""
 
-    # First attempt: with proxy (if configured)
-    if proxy_config:
+    # Stage 1: Webshare rotating residential proxy (highest success rate)
+    if transcript is None and webshare_proxy:
         try:
-            logger.info(f"[Tier 1] Trying with proxy: {proxy_config.https_url}")
-            transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=True)
-        except Exception as proxy_err:
-            logger.warning(f"[Tier 1] Proxy attempt failed: {type(proxy_err).__name__}: {proxy_err}")
-            # Retry without proxy
-            logger.info("[Tier 1] Retrying without proxy...")
+            logger.info("[Tier 1] Trying Webshare rotating residential proxy...")
+            transcript, desc = _try_fetch_captions_with_config(video_id, languages, webshare_proxy)
+            desc = "with Webshare"
+        except Exception as e:
+            errors.append(f"webshare: {type(e).__name__}: {e}")
+            logger.warning(f"[Tier 1] Webshare proxy failed: {errors[-1]}")
+
+    # Stage 2: direct (no proxy)
+    if transcript is None:
+        try:
+            logger.info("[Tier 1] Trying direct (no proxy)...")
             transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=False)
-    else:
-        transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=False)
+        except Exception as e:
+            errors.append(f"direct: {type(e).__name__}: {e}")
+            logger.warning(f"[Tier 1] Direct failed: {errors[-1]}")
+
+    # Stage 3: residential proxy (if configured)
+    if transcript is None and residential_proxy:
+        try:
+            logger.info("[Tier 1] Trying residential proxy...")
+            transcript, desc = _try_fetch_captions(video_id, languages, use_proxy=True)
+        except Exception as e:
+            errors.append(f"residential: {type(e).__name__}: {e}")
+            logger.warning(f"[Tier 1] Residential proxy failed: {errors[-1]}")
+
+    # Stage 4: Tor proxy
+    if transcript is None and tor_proxy:
+        try:
+            logger.info("[Tier 1] Trying Tor proxy...")
+            transcript, desc = _try_fetch_captions_with_config(video_id, languages, tor_proxy)
+        except Exception as e:
+            errors.append(f"tor: {type(e).__name__}: {e}")
+            logger.warning(f"[Tier 1] Tor proxy failed: {errors[-1]}")
+
+    if transcript is None:
+        raise Exception(f"All Tier 1 attempts failed: {'; '.join(errors)}")
 
     # Convert to raw data format (list of dicts with text, start, duration)
     snippets = transcript.to_raw_data()
@@ -605,6 +693,8 @@ def get_transcript(
             recommendations.append("Update cookies.txt with fresh browser cookies")
         if "429" in error_str or "rate" in error_str:
             recommendations.append("Rate limited - try again later")
+        if _is_innertube_context_error(error_str):
+            recommendations.append("Update yt-dlp to the latest version")
 
     if tier3_error:
         error_parts.append(f"pytubefix: {tier3_error}")
