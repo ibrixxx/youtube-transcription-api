@@ -27,8 +27,10 @@ from youtube_transcript_api._errors import (
 from app.config import get_settings
 from app.services.youtube import (
     extract_video_id,
+    detect_platform,
     download_audio,
     download_audio_pytubefix,
+    download_audio_twitter,
     VideoNotFoundError,
     VideoUnavailableError,
     DownloadError,
@@ -548,6 +550,47 @@ def _fetch_with_assemblyai_direct(
     )
 
 
+def _fetch_twitter_with_ytdlp_assemblyai(
+    video_url: str,
+    temp_dir: str,
+    speaker_labels: bool = True,
+    speakers_expected: int | None = None,
+    language: str | None = None,
+) -> TranscriptResult:
+    """
+    Fetch transcript from Twitter/X video using yt-dlp + AssemblyAI.
+
+    Twitter videos have no caption system, so we always download audio
+    and transcribe with AssemblyAI.
+    """
+    logger.info(f"[Twitter] Attempting yt-dlp + AssemblyAI for: {video_url}")
+
+    audio_path, metadata = download_audio_twitter(video_url, temp_dir)
+
+    transcript_data = transcribe_audio(
+        audio_path=audio_path,
+        speaker_labels=speaker_labels,
+        speakers_expected=speakers_expected,
+        language=language,
+    )
+
+    logger.info(
+        f"[Twitter] SUCCESS - Transcript ID: {transcript_data['id']}, "
+        f"duration: {transcript_data['audio_duration']}s"
+    )
+
+    return TranscriptResult(
+        method=TranscriptMethod.YTDLP_ASSEMBLYAI,
+        text=transcript_data["text"],
+        utterances=transcript_data["utterances"],
+        speakers=transcript_data["speakers"],
+        confidence=transcript_data["confidence"],
+        audio_duration=transcript_data["audio_duration"],
+        language=transcript_data["language"],
+        transcript_id=transcript_data["id"],
+    )
+
+
 def get_transcript(
     video_url: str,
     temp_dir: str,
@@ -557,22 +600,25 @@ def get_transcript(
     prefer_diarization: bool = False,
 ) -> TranscriptResult:
     """
-    Get transcript using 4-tier fallback strategy.
+    Get transcript using platform-aware fallback strategy.
 
-    Strategy:
-    1. Try youtube-transcript-api (fast, for videos with captions)
-    2. If that fails, use yt-dlp + AssemblyAI
-    3. If that fails, use pytubefix + AssemblyAI (different implementation)
-    4. If that fails, try AssemblyAI direct URL (last resort)
+    For YouTube (4-tier):
+    1. youtube-transcript-api (fast, for videos with captions)
+    2. yt-dlp + AssemblyAI
+    3. pytubefix + AssemblyAI
+    4. AssemblyAI direct URL (last resort)
+
+    For Twitter/X (2-tier):
+    1. yt-dlp + AssemblyAI (no caption system on Twitter)
+    2. AssemblyAI direct URL (last resort)
 
     Args:
-        video_url: YouTube video URL or ID
+        video_url: Video URL (YouTube or Twitter/X)
         temp_dir: Temporary directory for audio downloads
-        speaker_labels: Whether to enable speaker diarization (AssemblyAI only)
-        speakers_expected: Expected number of speakers (AssemblyAI only)
+        speaker_labels: Whether to enable speaker diarization
+        speakers_expected: Expected number of speakers
         language: Preferred language code
-        prefer_diarization: If True, skip Tier 1 and go straight to AssemblyAI
-                           for speaker diarization support
+        prefer_diarization: If True, skip YouTube caption tier
 
     Returns:
         TranscriptResult with transcript data and method used
@@ -582,6 +628,52 @@ def get_transcript(
         VideoNotFoundError: Video doesn't exist
         VideoUnavailableError: Video is private/restricted
     """
+    platform = detect_platform(video_url)
+
+    # === Twitter/X pipeline ===
+    if platform == "twitter":
+        tier1_error: Exception | None = None
+        tier2_error: Exception | None = None
+
+        # Tier 1: yt-dlp + AssemblyAI
+        try:
+            return _fetch_twitter_with_ytdlp_assemblyai(
+                video_url=video_url,
+                temp_dir=temp_dir,
+                speaker_labels=speaker_labels,
+                speakers_expected=speakers_expected,
+                language=language,
+            )
+        except (VideoNotFoundError, VideoUnavailableError):
+            raise
+        except Exception as e:
+            tier1_error = e
+            logger.warning(f"[Twitter Tier 1] yt-dlp + AssemblyAI failed: {e}")
+
+        # Tier 2: AssemblyAI direct URL
+        try:
+            return _fetch_with_assemblyai_direct(
+                video_id=video_url,
+                video_url=video_url,
+                speaker_labels=speaker_labels,
+                speakers_expected=speakers_expected,
+                language=language,
+            )
+        except Exception as e:
+            tier2_error = e
+            logger.warning(f"[Twitter Tier 2] AssemblyAI direct failed: {e}")
+
+        error_parts = []
+        if tier1_error:
+            error_parts.append(f"yt-dlp: {tier1_error}")
+        if tier2_error:
+            error_parts.append(f"Direct: {tier2_error}")
+
+        raise NoCaptionsAvailableError(
+            f"Could not transcribe Twitter/X video. {'; '.join(error_parts)}"
+        )
+
+    # === YouTube pipeline (existing logic) ===
     video_id = extract_video_id(video_url)
     if not video_id:
         raise VideoNotFoundError("Invalid YouTube URL format")
@@ -590,8 +682,8 @@ def get_transcript(
     normalized_url = f"https://www.youtube.com/watch?v={video_id}"
 
     # Track errors for logging
-    tier1_error: Exception | None = None
-    tier2_error: Exception | None = None
+    tier1_error = None
+    tier2_error = None
     tier3_error: Exception | None = None
     tier4_error: Exception | None = None
 

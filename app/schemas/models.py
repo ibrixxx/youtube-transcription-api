@@ -14,6 +14,12 @@ YOUTUBE_URL_PATTERNS = [
     r"^[a-zA-Z0-9_-]{11}$",  # Just the video ID
 ]
 
+# Twitter/X URL patterns for validation
+TWITTER_URL_PATTERNS = [
+    r"^(https?://)?(www\.)?(twitter\.com|x\.com)/.+/status/\d+",
+    r"^https?://t\.co/.+",
+]
+
 
 def is_valid_youtube_url(url: str) -> bool:
     """Check if URL is a valid YouTube URL or video ID."""
@@ -24,6 +30,19 @@ def is_valid_youtube_url(url: str) -> bool:
     if "v=" in url and re.search(r"v=([a-zA-Z0-9_-]{11})", url):
         return True
     return False
+
+
+def is_valid_twitter_url(url: str) -> bool:
+    """Check if URL is a valid Twitter/X video URL."""
+    for pattern in TWITTER_URL_PATTERNS:
+        if re.match(pattern, url):
+            return True
+    return False
+
+
+def is_valid_video_url(url: str) -> bool:
+    """Check if URL is a valid YouTube or Twitter/X URL."""
+    return is_valid_youtube_url(url) or is_valid_twitter_url(url)
 
 
 # ============ Request Models ============
@@ -40,8 +59,8 @@ class TranscribeRequest(BaseModel):
     @field_validator("video_url")
     @classmethod
     def validate_video_url(cls, v: str) -> str:
-        if not is_valid_youtube_url(v):
-            raise ValueError("Invalid YouTube URL or video ID")
+        if not is_valid_video_url(v):
+            raise ValueError("Invalid video URL. Supported: YouTube and Twitter/X URLs")
         return v
 
     @field_validator("speakers_expected")
@@ -79,7 +98,7 @@ class TranscriptData(BaseModel):
 
 
 class VideoMetadata(BaseModel):
-    """YouTube video metadata."""
+    """Video metadata (YouTube or Twitter/X)."""
 
     video_id: str
     title: str
@@ -90,6 +109,7 @@ class VideoMetadata(BaseModel):
     view_count: int | None = None
     upload_date: str | None = None
     description: str | None = None
+    platform: str | None = None  # "youtube", "twitter", or None
 
 
 class TranscribeResponseData(BaseModel):
@@ -100,6 +120,7 @@ class TranscribeResponseData(BaseModel):
     author: str
     thumbnail: str
     transcript: TranscriptData
+    platform: str | None = None  # "youtube", "twitter"
 
 
 class SuccessResponse(BaseModel):

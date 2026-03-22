@@ -29,8 +29,11 @@ from app.services.youtube import (
     YouTubeError,
     DownloadError,
     extract_video_id,
+    detect_platform,
     download_audio,
     download_audio_pytubefix,
+    download_audio_twitter,
+    get_metadata_via_ytdlp,
     _get_metadata_via_oembed,
 )
 
@@ -52,14 +55,10 @@ def _format_sse(event: str, data: dict) -> str:
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
     """
-    Get transcript for a YouTube video using optimized parallel strategy.
+    Get transcript for a YouTube or Twitter/X video.
 
-    Strategy:
-    1. Fetch oEmbed metadata + Tier 1 captions in parallel
-    2. If Tier 1 succeeds, return immediately (1-3s for ~90% of requests)
-    3. If Tier 1 fails, go straight to Tier 2/3/4 (uses oEmbed metadata for title/author)
-
-    Note: Speaker diarization is only available via AssemblyAI (Tier 2/3).
+    For YouTube: optimized parallel strategy with oEmbed + captions fast path.
+    For Twitter/X: yt-dlp download + AssemblyAI transcription.
 
     The audio file is automatically cleaned up after transcription.
     """
@@ -67,6 +66,70 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
     temp_dir = None
 
     try:
+        platform = detect_platform(request.video_url)
+
+        # === Twitter/X path ===
+        if platform == "twitter":
+            temp_dir = tempfile.mkdtemp()
+
+            # Get metadata via yt-dlp
+            try:
+                metadata = await asyncio.to_thread(get_metadata_via_ytdlp, request.video_url)
+            except Exception as e:
+                logger.warning(f"[twitter] Metadata fetch failed: {e}")
+                metadata = {
+                    "video_id": request.video_url,
+                    "title": "Unknown",
+                    "channel_name": "Unknown",
+                    "thumbnail": "",
+                    "duration": 0,
+                }
+
+            # Get transcript using platform-aware pipeline
+            try:
+                result = await asyncio.to_thread(
+                    get_transcript,
+                    video_url=request.video_url,
+                    temp_dir=temp_dir,
+                    speaker_labels=request.speaker_labels,
+                    speakers_expected=request.speakers_expected,
+                    language=request.language,
+                )
+            except (VideoNotFoundError, VideoUnavailableError) as e:
+                return TranscribeResponse(success=False, error=str(e))
+            except NoCaptionsAvailableError as e:
+                return TranscribeResponse(success=False, error=str(e))
+
+            utterances = None
+            if result.utterances:
+                utterances = [
+                    Utterance(
+                        speaker=u["speaker"], text=u["text"],
+                        start=u["start"], end=u["end"], confidence=u["confidence"],
+                    )
+                    for u in result.utterances
+                ]
+
+            response_data = TranscribeResponseData(
+                video_id=metadata.get("video_id", ""),
+                title=metadata.get("title", "Unknown"),
+                author=metadata.get("channel_name", "Unknown"),
+                thumbnail=metadata.get("thumbnail", ""),
+                transcript=TranscriptData(
+                    id=result.transcript_id,
+                    text=result.text,
+                    utterances=utterances,
+                    speakers=result.speakers,
+                    confidence=result.confidence,
+                    audio_duration=result.audio_duration or metadata.get("duration"),
+                    language=result.language,
+                    method=result.method.value,
+                ),
+                platform="twitter",
+            )
+            return TranscribeResponse(success=True, data=response_data)
+
+        # === YouTube path (existing logic) ===
         video_id = extract_video_id(request.video_url)
         if not video_id:
             return TranscribeResponse(success=False, error="Invalid YouTube URL format")
@@ -127,6 +190,7 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
                     language=result.language,
                     method=result.method.value,
                 ),
+                platform="youtube",
             )
 
             return TranscribeResponse(success=True, data=response_data)
@@ -204,6 +268,7 @@ async def transcribe_video(request: TranscribeRequest) -> TranscribeResponse:
                 language=result.language,
                 method=result.method.value,
             ),
+            platform="youtube",
         )
 
         return TranscribeResponse(success=True, data=response_data)
@@ -238,6 +303,87 @@ async def transcribe_video_stream(request: TranscribeRequest):
     async def event_generator():
         temp_dir = None
         try:
+            platform = detect_platform(request.video_url)
+
+            # === Twitter/X streaming path ===
+            if platform == "twitter":
+                temp_dir = tempfile.mkdtemp()
+
+                # Fetch metadata via yt-dlp
+                try:
+                    metadata = await asyncio.to_thread(get_metadata_via_ytdlp, request.video_url)
+                    yield _format_sse("metadata", {
+                        "video_id": metadata.get("video_id", ""),
+                        "title": metadata.get("title", "Unknown"),
+                        "author": metadata.get("channel_name", "Unknown"),
+                        "thumbnail": metadata.get("thumbnail", ""),
+                        "duration": metadata.get("duration", 0),
+                        "platform": "twitter",
+                    })
+                except Exception as e:
+                    logger.warning(f"[stream/twitter] Metadata failed: {e}")
+                    metadata = {
+                        "video_id": request.video_url,
+                        "title": "Unknown",
+                        "channel_name": "Unknown",
+                        "thumbnail": "",
+                        "duration": 0,
+                    }
+
+                # Download audio
+                try:
+                    audio_path, dl_metadata = await asyncio.to_thread(
+                        download_audio_twitter, request.video_url, temp_dir,
+                    )
+                except (VideoNotFoundError, VideoUnavailableError) as e:
+                    yield _format_sse("error", {"error": str(e), "phase": "download"})
+                    return
+                except Exception as e:
+                    yield _format_sse("error", {"error": f"Failed to download: {e}", "phase": "download"})
+                    return
+
+                # Transcribe with AssemblyAI
+                try:
+                    transcript_data = await asyncio.to_thread(
+                        transcribe_audio,
+                        audio_path=audio_path,
+                        speaker_labels=request.speaker_labels,
+                        speakers_expected=request.speakers_expected,
+                        language=request.language,
+                    )
+                except Exception as e:
+                    yield _format_sse("error", {"error": str(e), "phase": "transcription"})
+                    return
+
+                utterances = None
+                if transcript_data.get("utterances"):
+                    utterances = [
+                        {"speaker": u["speaker"], "text": u["text"],
+                         "start": u["start"], "end": u["end"],
+                         "confidence": u["confidence"]}
+                        for u in transcript_data["utterances"]
+                    ]
+
+                yield _format_sse("complete", {
+                    "video_id": metadata.get("video_id", ""),
+                    "title": metadata.get("title", "Unknown"),
+                    "author": metadata.get("channel_name", "Unknown"),
+                    "thumbnail": metadata.get("thumbnail", ""),
+                    "platform": "twitter",
+                    "transcript": {
+                        "id": transcript_data["id"],
+                        "text": transcript_data["text"],
+                        "utterances": utterances,
+                        "speakers": transcript_data["speakers"],
+                        "confidence": transcript_data["confidence"],
+                        "audio_duration": transcript_data["audio_duration"] or metadata.get("duration"),
+                        "language": transcript_data["language"],
+                        "method": "ytdlp_assemblyai",
+                    },
+                })
+                return
+
+            # === YouTube streaming path (existing logic) ===
             # --- Validation ---
             video_id = extract_video_id(request.video_url)
             if not video_id:

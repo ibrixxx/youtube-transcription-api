@@ -252,6 +252,30 @@ YOUTUBE_URL_PATTERNS = [
     r"^(https?://)?(www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{11})",
 ]
 
+# Twitter/X URL patterns
+TWITTER_URL_PATTERNS = [
+    r"^(https?://)?(www\.)?(twitter\.com|x\.com)/.+/status/(\d+)",
+    r"^https?://t\.co/.+",
+]
+
+
+def detect_platform(url: str) -> str:
+    """Detect which platform a URL belongs to. Returns 'youtube', 'twitter', or 'unknown'."""
+    if extract_video_id(url) is not None:
+        return "youtube"
+    for pattern in TWITTER_URL_PATTERNS:
+        if re.match(pattern, url):
+            return "twitter"
+    return "unknown"
+
+
+def extract_twitter_status_id(url: str) -> str | None:
+    """Extract Twitter/X status ID from URL."""
+    match = re.search(r"(?:twitter\.com|x\.com)/.+/status/(\d+)", url)
+    if match:
+        return match.group(1)
+    return None
+
 
 def extract_video_id(url: str) -> str | None:
     """Extract YouTube video ID from various URL formats."""
@@ -774,3 +798,156 @@ def download_audio_pytubefix(video_url: str, output_dir: str | None = None) -> t
         raise VideoNotFoundError(f"Video not found via pytubefix (tried all clients): {video_id}")
     else:
         raise DownloadError(f"All pytubefix clients failed for {video_id}: {last_error}")
+
+
+def get_metadata_via_ytdlp(url: str) -> dict[str, Any]:
+    """
+    Get video metadata using yt-dlp --dump-json (no download).
+    Works for any URL yt-dlp supports (YouTube, Twitter/X, etc).
+    """
+    ydl_opts = {
+        **get_common_ydl_opts(),
+        "skip_download": True,
+        # Remove YouTube-specific extractor args for non-YouTube URLs
+    }
+
+    platform = detect_platform(url)
+
+    # Remove YouTube-specific options for non-YouTube platforms
+    if platform != "youtube":
+        ydl_opts.pop("extractor_args", None)
+        ydl_opts.pop("cookiefile", None)
+        ydl_opts["proxy"] = ""  # Disable proxy — Twitter doesn't need it
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if info is None:
+            raise VideoNotFoundError(f"Video not found: {url}")
+
+        # Extract a usable video ID
+        video_id = info.get("id", "")
+        thumbnail = info.get("thumbnail", "")
+
+        return {
+            "video_id": video_id,
+            "title": info.get("title", "Unknown"),
+            "channel_name": info.get("uploader", info.get("channel", "Unknown")),
+            "thumbnail": thumbnail,
+            "thumbnail_small": thumbnail,
+            "duration": info.get("duration", 0) or 0,
+            "view_count": info.get("view_count"),
+            "upload_date": info.get("upload_date"),
+            "description": (info.get("description") or "")[:500],
+            "platform": platform,
+            "original_url": url,
+        }
+
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e).lower()
+        if "not found" in error_msg or "404" in error_msg:
+            raise VideoNotFoundError(f"Video not found: {url}")
+        elif "private" in error_msg or "unavailable" in error_msg:
+            raise VideoUnavailableError(f"Video is private or unavailable: {url}")
+        else:
+            raise DownloadError(f"Failed to get metadata: {e}")
+    except Exception as e:
+        raise YouTubeError(f"Unexpected error getting metadata: {e}")
+
+
+def download_audio_twitter(video_url: str, output_dir: str | None = None) -> tuple[str, dict[str, Any]]:
+    """
+    Download audio from a Twitter/X video using yt-dlp.
+
+    Args:
+        video_url: Twitter/X status URL
+        output_dir: Directory to save the audio file
+
+    Returns:
+        Tuple of (audio_file_path, metadata_dict)
+    """
+    logger.info(f"[twitter] Downloading audio from: {video_url}")
+
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp()
+
+    # Extract status ID for filename
+    status_id = extract_twitter_status_id(video_url) or "twitter_video"
+
+    output_template = os.path.join(output_dir, f"{status_id}.%(ext)s")
+
+    ydl_opts = {
+        **get_common_ydl_opts(),
+        "format": "worstaudio[ext=m4a]/worstaudio/bestaudio",
+        "outtmpl": output_template,
+    }
+
+    # Remove YouTube-specific options and disable proxy for Twitter
+    ydl_opts.pop("extractor_args", None)
+    ydl_opts.pop("cookiefile", None)
+    ydl_opts["proxy"] = ""  # Disable proxy — Twitter doesn't need it
+
+    def _download_with_opts(opts: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+
+            if info is None:
+                raise VideoNotFoundError(f"Video not found: {video_url}")
+
+            # Find the downloaded file
+            audio_path = None
+            for ext in ["m4a", "webm", "opus", "mp4", "mp3", "ogg", "wav"]:
+                potential_path = os.path.join(output_dir, f"{status_id}.{ext}")
+                if os.path.exists(potential_path):
+                    audio_path = potential_path
+                    break
+
+            # Also check for files with the yt-dlp ID
+            if audio_path is None:
+                ytdlp_id = info.get("id", "")
+                if ytdlp_id:
+                    for ext in ["m4a", "webm", "opus", "mp4", "mp3", "ogg", "wav"]:
+                        potential_path = os.path.join(output_dir, f"{ytdlp_id}.{ext}")
+                        if os.path.exists(potential_path):
+                            audio_path = potential_path
+                            break
+
+            if audio_path is None:
+                raise DownloadError(f"Failed to download audio from: {video_url}")
+
+            thumbnail = info.get("thumbnail", "")
+
+            metadata = {
+                "video_id": info.get("id", status_id),
+                "title": info.get("title", "Unknown"),
+                "channel_name": info.get("uploader", info.get("channel", "Unknown")),
+                "thumbnail": thumbnail,
+                "duration": info.get("duration", 0) or 0,
+                "platform": "twitter",
+            }
+
+            return audio_path, metadata
+
+    try:
+        return _download_with_opts(ydl_opts)
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e).lower()
+
+        # Retry without proxy if proxy failed
+        if _is_proxy_error(error_msg) and ydl_opts.get("proxy") != "":
+            logger.warning("[twitter] Proxy error; retrying without proxy")
+            try:
+                return _download_with_opts(_ydl_opts_without_proxy(ydl_opts))
+            except yt_dlp.utils.DownloadError as retry_err:
+                e = retry_err
+                error_msg = str(e).lower()
+
+        if "not found" in error_msg or "404" in error_msg:
+            raise VideoNotFoundError(f"Tweet not found: {video_url}")
+        elif "private" in error_msg or "protected" in error_msg:
+            raise VideoUnavailableError(f"Tweet is private or protected: {video_url}")
+        else:
+            raise DownloadError(f"Failed to download from Twitter/X: {e}")
+    except Exception as e:
+        raise YouTubeError(f"Unexpected error downloading from Twitter/X: {e}")

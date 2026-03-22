@@ -3,12 +3,14 @@ import os
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.schemas.models import MetadataResponse, VideoMetadata
+from app.schemas.models import MetadataResponse, VideoMetadata, is_valid_video_url
 from app.services.youtube import (
     VideoNotFoundError,
     VideoUnavailableError,
     YouTubeError,
+    detect_platform,
     get_video_metadata,
+    get_metadata_via_ytdlp,
     is_valid_youtube_url,
     COOKIES_FILE,
 )
@@ -18,19 +20,27 @@ router = APIRouter()
 
 @router.get("/metadata", response_model=MetadataResponse)
 async def get_metadata(
-    video_url: str = Query(..., description="YouTube video URL or video ID"),
+    video_url: str = Query(..., description="Video URL (YouTube or Twitter/X)"),
 ) -> MetadataResponse:
     """
-    Get YouTube video metadata without downloading.
+    Get video metadata without downloading.
 
+    Supports YouTube and Twitter/X URLs.
     Returns video title, channel name, thumbnail URL, duration, etc.
     """
     # Validate URL
-    if not is_valid_youtube_url(video_url):
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
+    if not is_valid_video_url(video_url):
+        raise HTTPException(status_code=400, detail="Invalid video URL. Supported: YouTube and Twitter/X")
+
+    platform = detect_platform(video_url)
 
     try:
-        metadata = get_video_metadata(video_url)
+        # Twitter/X: use yt-dlp for metadata
+        if platform == "twitter":
+            metadata = get_metadata_via_ytdlp(video_url)
+        else:
+            # YouTube: existing logic (yt-dlp → oEmbed fallback)
+            metadata = get_video_metadata(video_url)
 
         return MetadataResponse(
             success=True,
@@ -38,12 +48,13 @@ async def get_metadata(
                 video_id=metadata["video_id"],
                 title=metadata["title"],
                 channel_name=metadata["channel_name"],
-                thumbnail=metadata["thumbnail"],
-                thumbnail_small=metadata["thumbnail_small"],
-                duration=metadata["duration"],
+                thumbnail=metadata.get("thumbnail", ""),
+                thumbnail_small=metadata.get("thumbnail_small"),
+                duration=metadata.get("duration", 0),
                 view_count=metadata.get("view_count"),
                 upload_date=metadata.get("upload_date"),
                 description=metadata.get("description"),
+                platform=platform,
             ),
         )
 
