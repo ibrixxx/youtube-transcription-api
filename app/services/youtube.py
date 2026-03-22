@@ -826,20 +826,24 @@ def get_metadata_via_ytdlp(url: str) -> dict[str, Any]:
         if info is None:
             raise VideoNotFoundError(f"Video not found: {url}")
 
-        # Extract a usable video ID
-        video_id = info.get("id", "")
-        thumbnail = info.get("thumbnail", "")
+        # Normalize nullable extractor fields so downstream Pydantic models
+        # don't fail with 500s when a platform omits optional metadata.
+        video_id = str(info.get("id") or extract_twitter_status_id(url) or "")
+        thumbnail = str(info.get("thumbnail") or "")
+        title = str(info.get("title") or "Unknown")
+        channel_name = str(info.get("uploader") or info.get("channel") or "Unknown")
+        duration = int(info.get("duration") or 0)
 
         return {
             "video_id": video_id,
-            "title": info.get("title", "Unknown"),
-            "channel_name": info.get("uploader", info.get("channel", "Unknown")),
+            "title": title,
+            "channel_name": channel_name,
             "thumbnail": thumbnail,
             "thumbnail_small": thumbnail,
-            "duration": info.get("duration", 0) or 0,
+            "duration": duration,
             "view_count": info.get("view_count"),
             "upload_date": info.get("upload_date"),
-            "description": (info.get("description") or "")[:500],
+            "description": str(info.get("description") or "")[:500],
             "platform": platform,
             "original_url": url,
         }
@@ -916,14 +920,14 @@ def download_audio_twitter(video_url: str, output_dir: str | None = None) -> tup
             if audio_path is None:
                 raise DownloadError(f"Failed to download audio from: {video_url}")
 
-            thumbnail = info.get("thumbnail", "")
+            thumbnail = str(info.get("thumbnail") or "")
 
             metadata = {
-                "video_id": info.get("id", status_id),
-                "title": info.get("title", "Unknown"),
-                "channel_name": info.get("uploader", info.get("channel", "Unknown")),
+                "video_id": str(info.get("id") or status_id),
+                "title": str(info.get("title") or "Unknown"),
+                "channel_name": str(info.get("uploader") or info.get("channel") or "Unknown"),
                 "thumbnail": thumbnail,
-                "duration": info.get("duration", 0) or 0,
+                "duration": int(info.get("duration") or 0),
                 "platform": "twitter",
             }
 

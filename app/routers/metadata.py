@@ -1,4 +1,5 @@
 import http.cookiejar
+import logging
 import os
 
 from fastapi import APIRouter, HTTPException, Query
@@ -16,6 +17,7 @@ from app.services.youtube import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/metadata", response_model=MetadataResponse)
@@ -66,6 +68,10 @@ async def get_metadata(
 
     except YouTubeError as e:
         return MetadataResponse(success=False, error=str(e))
+
+    except Exception as e:
+        logger.exception("Unexpected metadata error for %s", video_url)
+        return MetadataResponse(success=False, error=f"Failed to fetch metadata: {e}")
 
 
 @router.get("/cookies-status")

@@ -111,6 +111,14 @@ class VideoMetadata(BaseModel):
     description: str | None = None
     platform: str | None = None  # "youtube", "twitter", or None
 
+    @field_validator("duration", mode="before")
+    @classmethod
+    def coerce_duration(cls, v: object) -> int:
+        """Twitter returns float durations (e.g. 84.584), coerce to int."""
+        if v is None:
+            return 0
+        return int(v)
+
 
 class TranscribeResponseData(BaseModel):
     """Data returned from transcribe endpoint."""
